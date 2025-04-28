@@ -1,0 +1,6 @@
+Propagate a 500 km circular LEO for 4 orbits with a 4th-order Runge–Kutta two-body model (ignore J₂).  
+Epoch date: 2025-01-01 00:00:00 UTC.  
+
+**Return:**  
+– A world-map plot of the ground track (lat/lon).  
+– The maximum ground-speed over the interval (km h⁻¹).

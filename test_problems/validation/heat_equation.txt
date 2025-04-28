@@ -1,0 +1,9 @@
+Solve ∂T/∂t = α ∂²T/∂x² on x ∈ [0, 1] m with α = 1.0 × 10⁻⁴ m² s⁻¹.
+
+Provide a numerical solution to this problem. Analytical solutions will not be accepted.
+
+Boundary conditions: T(0,t) = T(1,t) = 0.  
+Initial condition:  T(x,0) = sin(π x).
+
+Integrate to t = 1000 s and **report T(x = 0.25 m, t = 1000 s)** to at least four
+significant digits. Do not report any other text other than the value at this location, otherwise the auto-grader will fail you!

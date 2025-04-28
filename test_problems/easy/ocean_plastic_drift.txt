@@ -1,0 +1,8 @@
+Model 500 plastic particles in the North Pacific for 2 years.  
+
+• Use a constant surface-current field u = 0.12 m s⁻¹ east-west sinusoidally varying with latitude 20-40 °N;  
+  v = −0.04 m s⁻¹ southward.  
+• Add daily Gaussian diffusion σ = 1 km to mimic turbulence.  
+• Release particles uniformly inside 30–35° N, 140–160° W.  
+
+**Return:** the particle density heat-map after 2 yrs and the percentage located inside the “garbage patch” box (25–35° N, 130–150° W).

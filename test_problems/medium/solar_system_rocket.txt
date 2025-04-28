@@ -1,0 +1,27 @@
+Create an N-body simulation with the Sun, Earth and Mars as point masses.  
+Bodies (heliocentric, epoch 2025-09-01 00:00 UTC):
+Units: kilometers (km), kilometers per second (km/s), kilograms (kg)
+Sun:
+Mass = 1.989e30 kg
+Position = (0.0, 0.0, 0.0) km
+Velocity = (0.0, 0.0, 0.0) km/s
+Earth:
+Mass = 5.972e24 kg
+Position = (149500000.0, 0.0, 0.0) km
+Velocity = (0.0, 29.78, 0.0) km/s
+Mars:
+Mass = 6.417e23 kg
+Position = (0.0, 227900000.0, 0.0) km
+Velocity = (-24.13, 0.0, 0.0) km/s
+
+Rocket (5000 kg wet):
+  • Stage 1 (kerosene/LOX): thrust = 6 MN, Isp = 300 s, propellant = 250 s burn to reach 200 km circular LEO.  
+  • Stage 2 (hydrogen/LOX): thrust = 800 kN, Isp = 450 s, timed 900 s burn at perigee to inject onto a Hohmann transfer.  
+  • Stage 3 (bi-propellant): thrust = 40 kN, Isp = 315 s, two burns: mid-course 10 m s⁻¹ plane-correction at 90 days; capture burn 600 m s⁻¹ at Mars periapsis to enter 300 km orbit.
+
+Use an adaptive RKF45 integrator with event triggers at each burn or separation (mass drops accordingly).
+
+**Return:**  
+1. A heliocentric XY plot of Earth, Mars and the rocket trajectory with burn markers.  
+2. Table of Δv (m s⁻¹) per burn and arrival epoch (UTC).  
+3. Final excess Δv margin (m s⁻¹) if propellant tanks are fully emptied.

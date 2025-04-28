@@ -1,0 +1,7 @@
+Integrate d²x/dt² + ω² x = 0 with ω = 5 rad s⁻¹.
+
+Provide a numerical solution to this problem. Analytical solutions will not be accepted.
+
+Initial conditions: x(0) = 0 m,  v(0) = 2 m s⁻¹.
+
+Compute x at t = 2 s and **return that single scalar value**. Do not report any other text other than the value at this location, otherwise the auto-grader will fail you!

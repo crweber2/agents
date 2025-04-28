@@ -1,0 +1,4 @@
+Solve u_t + u u_x = 0.01 u_xx on x∈[−1,1], periodic, u(x,0)=−sin πx.  
+Fourier spectral (N=512), RK4, t = 2.
+
+**Return:** u(x,2) plot and verify L² norm conservation within 1 %.

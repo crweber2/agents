@@ -1,0 +1,6 @@
+Generate a 2-D finite-difference model (Δx = 50 m) of the nighttime surface-temperature evolution over a 5 km × 5 km city for 12 h (α = 1.2 × 10⁻⁶ m² s⁻¹).
+
+• Buildings emit 40 W m⁻² sensible heat; parks emit 5 W m⁻².  
+• Introduce green-roof retrofit over 30 % of roof cells (random), cutting their heat emission to 15 W m⁻².  
+
+**Return:** contour maps at t = 0 h and t = 12 h plus mean temperature reduction (°C) due to retrofit.

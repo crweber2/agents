@@ -1,0 +1,7 @@
+Design a half-wave dipole (frequency 2.4 GHz) above an infinite perfect-electric-conductor ground plane.
+
+• Decision variables: dipole length L, height h (range 0.2–0.7 λ).  
+• Objective: maximise simulated broadside gain using the NEC2 Python wrapper (pynec).  
+• GA: pop = 40, gens = 80, tournament = 3, crossover = 0.9, mutation = 0.1.  
+
+**Return:** evolution plot of best gain (dBi) and the optimal L, h values.

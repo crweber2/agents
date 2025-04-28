@@ -1,0 +1,9 @@
+Simulate a 2-D car for 60 s: initial v = 25 m s⁻¹ north, constant steering generating a 500 m radius turn, a = 0.
+
+Measurements  
+• GPS: 1 Hz, σ_pos = 3 m.  
+• IMU accelerometer & gyro: 50 Hz, σ_acc = 0.05 m s⁻², σ_gyro = 0.1 deg s⁻¹.  
+
+Implement an Extended Kalman Filter (state = [x,y,ψ,v]).  
+
+**Return:** plot true vs estimated path, heading and speed; give RMS position error (m).

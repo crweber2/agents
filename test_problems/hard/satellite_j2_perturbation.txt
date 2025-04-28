@@ -1,0 +1,4 @@
+Propagate a 700 km circular orbit for 30 days including Earth J₂.  
+Use Cowell’s formulation with 60 s time step.
+
+**Return:** plots of semi-major axis, inclination, and RAAN vs time; report total RAAN drift (deg).

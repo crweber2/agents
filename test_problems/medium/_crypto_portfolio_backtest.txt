@@ -1,0 +1,9 @@
+Download daily OHLCV data for BTC, ETH, and LTC from 2018-01-01 to present (yfinance).  
+
+Strategy  
+• Each Monday at close: compute 4-week momentum (%-return).  
+• Hold equal weight in the two assets with highest momentum for the next week (cash otherwise).  
+
+Benchmark = equal-weight buy-and-hold.
+
+**Return:** equity-curve plot, annualised Sharpe ratios, and maximum drawdown for both strategies.

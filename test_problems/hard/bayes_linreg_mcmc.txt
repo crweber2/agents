@@ -1,0 +1,5 @@
+Create synthetic (X,y) with n=150, d=4, σ_noise=0.7.  
+Prior w~N(0,5²).  Implement Metropolis-Hastings (diagonal proposal σ = 0.2).  
+Run 30 000 samples, discard 5 000 burn-in.
+
+**Return:** trace plots, marginal histograms and posterior means ± SD of w.

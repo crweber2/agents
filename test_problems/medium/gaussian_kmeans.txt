@@ -1,0 +1,6 @@
+Generate 3 synthetic Gaussian clusters (σ = 0.5) in 3-D space, 500 points each, centres random in [−5,5]³.
+
+• Apply k-means (k = 3, n_init = 20).  
+• Reduce to 2-D with PCA and plot labelled points plus centroids.
+
+**Return:** final inertia and confusion matrix against true labels.

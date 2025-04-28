@@ -1,0 +1,9 @@
+Input files: load.csv (hourly kWh), pv.csv (hourly PV kWh).  
+Battery: 13.5 kWh, 90 % round-trip, max 3 kW charge/discharge.  
+Tariff: TOU — off-peak $0.12 kWh (00:00–16:00), peak $0.35 kWh (16:00–21:00).
+
+Formulate a mixed-integer linear program (MILP) on a one-day horizon with 1-h resolution to minimise cost.
+
+**Return:**  
+1. A stacked-area plot of load, PV, battery charge/discharge.  
+2. Daily bill ($) with and without the battery, and percent savings.

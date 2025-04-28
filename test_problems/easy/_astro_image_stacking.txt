@@ -1,0 +1,7 @@
+Folder “stars_raw” contains 25 noisy 16-bit FITS images of the same star field (monochrome).  
+
+• Align images to sub-pixel accuracy with phase-correlation.  
+• Median-stack the aligned frames.  
+• Apply contrast-stretching (percentile 2–98) and save result as stacked.png.  
+
+**Show:** side-by-side before/after images and report the SNR improvement ratio.

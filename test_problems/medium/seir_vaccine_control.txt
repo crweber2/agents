@@ -1,0 +1,7 @@
+SEIR model with N = 1 000 000, β = 0.3, σ = 1/5, γ = 1/10.  
+Daily vaccination capacity = 5 000.
+
+Design a controller that allocates vaccines to susceptible individuals differently in three phases  
+(early, mid, late) to minimise cumulative infections.
+
+**Return:** time-series plots of S,E,I,R and total infections prevented vs a no-vaccine baseline.

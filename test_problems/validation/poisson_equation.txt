@@ -1,0 +1,6 @@
+Solve ∇²u = −2 π² sin(π x) sin(π y) on (x,y) ∈ [0,1]² with u = 0 on all
+boundaries (Dirichlet).
+
+Provide a numerical solution to this problem. Analytical solutions will not be accepted.
+
+**Report u(0.25, 0.25).** Do not report any other text other than the value at this location, otherwise the auto-grader will fail you!

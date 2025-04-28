@@ -1,0 +1,7 @@
+Solve ∂u/∂t + a ∂u/∂x = 0 on a periodic domain x ∈ [0, 1] m with a = 1 m s⁻¹.
+
+Provide a numerical solution to this problem. Analytical solutions will not be accepted.
+
+Initial condition: u(x,0) = exp(−((x − 0.5)/0.1)²).
+
+Integrate to t = 0.3 s and **report u(x = 0.5 m, t = 0.3 s)**. Do not report any other text other than the value at this location, otherwise the auto-grader will fail you!

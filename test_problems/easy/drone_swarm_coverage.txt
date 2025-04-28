@@ -1,0 +1,9 @@
+Simulate 10 identical quadrotor drones surveying a 200 m × 200 m area containing 15 circular no-fly obstacles (r = 10 m).  
+
+• Use a lawn-mower sweep algorithm with dynamic obstacle avoidance (potential-field repulsion).  
+• Each drone has vmax = 5 m s⁻¹.  
+• Start points: evenly spaced along the south edge.  
+
+**Return:**  
+1. An animated Matplotlib plot (saved as swarm.gif) of paths.  
+2. The time (s) when 95 % of free area is first visited by at least one drone.

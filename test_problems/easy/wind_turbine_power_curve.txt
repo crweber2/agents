@@ -1,0 +1,11 @@
+Simulate a single 3-blade horizontal-axis wind turbine.
+
+• Wind-speed samples: draw 10 000 speeds from a Rayleigh distribution (scale = 8 m s⁻¹).  
+• Use the idealised Cp curve  
+    Cp(V) = 0.44 · sin[0.4 (V − 2)] for 2 ≤ V ≤ 25 m s⁻¹, else Cp = 0.  
+• Rotor radius = 40 m, air density = 1.225 kg m⁻³.  
+• Compute instantaneous electrical power P = ½ ρ A V³ Cp and the annual-energy-production estimate (MWh yr⁻¹).  
+
+**Return:**  
+1. A histogram of the wind-speed samples overlaid with the rated, cut-in and cut-out points (2, 12, 25 m s⁻¹).  
+2. The mean power (kW) and annual-energy-production (MWh yr⁻¹).

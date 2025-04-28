@@ -1,0 +1,22 @@
+Simulate the 1-D Euler equations (ideal gas, γ = 1.4) on x ∈ [0 m, 1 m].
+
+Provide a numerical solution to this problem. Analytical solutions will not be accepted.
+
+Initial condition (t = 0):
+  • For x > 0 m (the entire domain) the gas is quiescent air  
+      p₀ = 1.00 × 10⁵ Pa,  T₀ = 300 K,  ρ₀ = p₀ / (R T₀) with R = 287 J kg⁻¹ K⁻¹,  u = 0.  
+  • A planar shock of Mach 3 relative to the undisturbed gas is placed at x = 0 m and allowed
+    to propagate rightward.  You may initialise the post-shock state with the Rankine–Hugoniot
+    values  
+      ρ₂ = 4.47984 kg m⁻³,  u₂ = 771.53 m s⁻¹,  p₂ = 1.03333 × 10⁶ Pa.
+
+Boundary conditions  
+  – x = 0 m: transmissive/outflow  
+  – x = 1 m: rigid, perfectly reflecting wall
+
+Run until the primary shock reaches the wall, reflects, and a distinct reflected
+shock has fully formed (≈ 1.3 ms; you may stop once the reflected shock is ∼0.1 m
+from the wall).
+
+**Return one number:** the pressure (Pa) immediately *behind* the reflected
+shock (region 3). Do not report any other text (or units) other than the value at this location, otherwise the auto-grader will fail you!

@@ -1,0 +1,16 @@
+Estimate radiative flux on a 1 mm-radius spherical capsule centred in a cylindrical gold hohlraum.
+
+Geometry  
+• Hohlraum: radius = 3 mm, length = 6 mm, axis = ẑ, equatorial plane at z = 0.  
+• Four laser hot-spots located on the inner wall at z = ±0.5 mm and z = ±1.5 mm (two rings).  
+  Each spot has Gaussian intensity profile with FWHM = 0.25 mm (σ ≈ 0.106 mm).  
+• Treat each spot as a continuum of Lambertian point emitters at T = 300 eV (constant).  
+
+Task  
+1. Use 10 000 Monte-Carlo rays per spot to compute the directional view factor F(θ) from each hot-spot ring to the capsule surface (θ = 0 ° at +z pole).  
+2. Sum contributions and convert to flux (W cm⁻²).  
+3. Bin results into 10 ° bands and fit a 4th-order Legendre polynomial.
+
+**Return:**  
+– Plot of flux vs polar angle θ with the fitted curve.  
+– The peak-to-valley flux ratio.

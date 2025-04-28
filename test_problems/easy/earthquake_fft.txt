@@ -1,0 +1,7 @@
+Load seismograph data from earthquake.csv (cols: time [s], accel [m s⁻²]).  
+• Detrend and window the signal with a Hann window.  
+• Compute the single-sided amplitude spectrum via FFT.  
+
+**Return:**  
+– A log-log plot of amplitude vs frequency up to 50 Hz.  
+– The three dominant frequencies (Hz) sorted descending by amplitude.
