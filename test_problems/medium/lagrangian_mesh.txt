@@ -1,0 +1,32 @@
+I need to mesh a problem for a 2D Lagrangian radiation-hydrodynamics simulation of an ICF experiment with novel geometry. The problem will have regions of different density. These regions will be polygons defined by their vertices, for example:
+
+domain_x = [0,10]
+domain_y = [0,10]
+domain_den = 0.1
+poly1 = dict(den=1,x=[1,2,3,3,1,1],y=[1,1,2,3,2,1])
+poly2 = dict(den=1,x=[5,6,6,5,5],  y=[4,4,5,5,4])
+
+The mesh will have NxM zones with N+1xM+1 edges. The edges will conform to the domain edge, eg:
+X[0,:] = 0
+X[-1,:] = 10
+Y[0,:] = 0
+Y[-1,:] = 10
+
+But the interior of the mesh will be non-uniform/distorted, with mesh lines to trace polygon edges exactly.
+
+Neighboring zones should be mass-matched, meaning that zones on opposite sides of an interface should have approximately equal mass per zone. This means that in the normal direction to the polygon interface, zones on the inside of the polygon will be finer by the density-ratio.
+
+No mesh lines should overlap. You can use an equipotential relaxer to relax the mesh, but keep the polygon geometries exactly as specified.
+
+Here's the strategy we should try: 
+1) Generate a uniform coarse mesh, then run number of equipotential smoothing iterations weighted by the density (you'll need to decide how to move the mesh and know where the original density was). 
+The mesh will move towards the dense regions. 
+2) Then we find the mesh lines that can snap to the polygon edges.
+It is very important that every line of the polygon overlaps with a continuous mesh line.
+To do this, for each line of the polygon, find the continuous mesh lines, either X[i1:i2,j] or X[i,j1:j2] (and Y) that are
+best suited to match the polygon lines, and move them to match exactly.
+3) Finally we smooth the mesh inside and outsized of these fixed lines to avoid overlapping 
+and keep everything smooth. Do not move the lines that are fixed to the polygon.
+Make sure you're providing plots of the mesh at these stages.
+
+Make sure to instruct executor agent to make png images of the mesh and use view_image tool to check that they look as desired.
