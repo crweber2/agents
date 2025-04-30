@@ -365,6 +365,8 @@ class LLMClient:
         self.model_id = model_id
         self.temperature = temperature
         self.debug = debug
+        if self.model_id == 'o3':
+            self.temperature = 1.0
 
     # ------------------------------------------------------------------
     def chat(self, *, messages: list[Mapping[str, Any]], tools: list[Mapping[str, Any]] | None = None) -> Any:  # noqa: D401
@@ -422,7 +424,7 @@ class Agent:
         tools: Sequence[Tool],
         model: LLMClient,
         name: str = "agent",
-        description: str | None = None,
+        description: str = "Coding agents that completes tasks using tools.",
         max_steps: int = 20,
         verbosity: int = 1,
         planning_interval: int | None = None,
@@ -431,9 +433,11 @@ class Agent:
         add_tools_to_system_prompt: bool = True,
         clear_memory_on_run: bool = False,
         system_message: str = (
-            "You are an autonomous coding agent.  Always interact via tool calls.\n"
-            "If the task is non-trivial start with `make_plan`.  Use `final_answer` *only*"
-            " once everything is complete."
+            "You are a highly skilled coding agent.  Your job is to complete "
+            "the tasks assigned to you using the provided tools. When completely "
+            "If the task is non-trivial start with `make_plan`.  Use `final_answer` *only* "
+            "once everything is complete."
+            "If you find yourself struggling with the same problem a couple times, "
         ),
     ) -> None:
         self.name = name
@@ -508,7 +512,7 @@ class Agent:
                 return answer
         # ------------- exhausted budget - force summary ------------------
         self._log("Step budget exhausted - forcing summary", 1)
-        summary = self._summarise_for_final()
+        summary = self._summarize_for_final()
         return summary
 
     # Let an Agent instance behave like a tool ------------------------------
@@ -721,18 +725,21 @@ class Agent:
         return final_answer
 
     # ------------------------------------------------------------------
-    def _summarise_for_final(self) -> str:  # noqa: D401
+    def _summarize_for_final(self) -> str:  # noqa: D401
         """Force a summary via *final_answer* tool after step budget exhausted."""
         summary_prompt = "Summarise the current progress so the user can continue on their own."
         # Only *final_answer* tool is allowed
         msg = self.model.chat(messages=self.memory.to_openai() + [ChatMessage.user(summary_prompt).to_openai()],
                                tools=[self._tool_to_openai(self.tools["final_answer"])])
-        tc = msg.tool_calls[0] if getattr(msg, "tool_calls", None) else None
+        tool_calls = _normalise_tool_calls(getattr(msg, "tool_calls", None))
+        if tool_calls is None:
+            return msg.content
+        tc = tool_calls[0] #if getattr(msg, "tool_calls", None) else None
         if tc and tc["function"]["name"] == "final_answer":
             answer = json.loads(tc["function"].get("arguments", "{}")).get("answer", "")
             return answer
-        # Fallback: return raw content
-        return msg.content or "(no summary)"
+        # # Fallback: return raw content
+        # return msg.content or "(no summary)"
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -789,7 +796,7 @@ class Agent:
 ###############################################################################
 
 
-def _build_default_agent(debug: bool, local: bool, confirm_edits: bool = False) -> Agent:  # noqa: D401
+def _build_default_agent(debug: bool, local: bool, confirm_edits: bool = False, oai_model: str = 'gpt-4.1') -> Agent:  # noqa: D401
     """Build a default agent with standard tools.
     
     Args:
@@ -797,7 +804,7 @@ def _build_default_agent(debug: bool, local: bool, confirm_edits: bool = False) 
         local: Use a local LLM server instead of OpenAI API
         confirm_edits: Whether file edits and deletes require user confirmation
     """
-    model = LLMClient(model_id="lmstudio" if local else "gpt-4.1", api_base="http://localhost:1234/v1" if local else None, debug=debug)
+    model = LLMClient(model_id="lmstudio" if local else oai_model, api_base="http://localhost:1234/v1" if local else None, debug=debug)
     tools: list[Tool] = [
         WriteFile(), 
         ReadFile(), 
@@ -818,23 +825,132 @@ def main() -> None:  # noqa: D401
     parser = argparse.ArgumentParser(description="Run the autonomous Agent")
     parser.add_argument("task", nargs="?", help="Initial user task (prompted if omitted)")
     parser.add_argument("-d", "--debug", action="store_true", help="Verbose OpenAI request/response logging")
-    parser.add_argument("-l", "--local", action="store_true", help="Use a local LLM")
+    parser.add_argument("-l", "--local", action="store_true",
+                        help="Use a local LLM instead of the OpenAI API for the executor agent")
+    parser.add_argument("-v", "--verbosity", type=int, default=3, choices=range(0,4),
+                        help="Verbosity level: 0-quiet 1-steps 2-rich 3-trace (default 2)")
+    parser.add_argument("-m", "--model", default="gpt-4.1", help="OpenAI model")
+    parser.add_argument("-w", "--wkdir", action="store_true", help="move to work dir")
     parser.add_argument("-c", "--confirm-edits", action="store_true", 
                         help="Require confirmation before editing or deleting files")
+    parser.add_argument("--confirm-plan", action="store_true", 
+                        help="Ask for confirmation after making initial plan")
+    parser.add_argument( "--end", action="store_true", 
+                        help="End on first final_answer")
+    parser.add_argument("--multi", action="store_true",
+                        help="Use multiple agents starting with a manager")
+    parser.add_argument( "--vision", action="store_true", 
+                        help="The model has vision and can use view_image tool")
+
     args = parser.parse_args()
 
-    agent = _build_default_agent(debug=args.debug, local=args.local, confirm_edits=args.confirm_edits)
-    user_task = args.task or input("User task: ")
+
+
+    # If task ends with .txt, assume it's a file path and read from it
+    if args.task and args.task.endswith(".txt"):
+        user_task = open(args.task).read()
+    elif args.task:
+        user_task = args.task
+    else:
+        # Fall back to prompting if no task provided
+        user_task = input("Enter your task: ")
+
+
+    if args.wkdir:
+        cwd = None
+        if cwd is None:
+            cwd = os.getcwd()
+
+        workdir = os.path.join(cwd,'work/tmp_'+_dt.datetime.now().strftime('%y%m%d_%H%M'))
+        os.makedirs(workdir,exist_ok=True)
+        print(f'moving to {workdir}')
+        os.chdir(workdir)
+
+    tools_all = [
+        WriteFile(), ReadFile(), EditFile(confirm_edits=args.confirm_edits), RunPython(),
+        RunBash(), Delete(confirm_edits=args.confirm_edits),
+        MakePlan(), ListFiles(), FinalAnswer()
+    ]
+    if args.vision:
+        tools_all.insert(-1,ViewImage())
+
+    model = LLMClient(
+        model_id="lmstudio" if args.local else args.model,
+        debug=args.debug,
+        api_base="http://localhost:1234/v1" if args.local else None,
+    )
+
+    agent = Agent(tools=tools_all,
+                    model=model,
+                    max_steps=25,
+                    verbosity=args.verbosity,
+                    name="code_agent",
+                    description="Writes/tests Python projects")
+    if args.multi:
+        agent_code = agent
+        agent_code.clear_memory_on_run = True
+
+        manager_prompt = ("You are the *manager_agent* - a senior engineer. Your first "
+            "task is to use the make_plan tool. In the plan you should start with "
+            "Goal: <the overall goal of the task -- restating it in your own words> "
+            "Completion Criteria: <what did the user specify that woiuld complete the task> "
+            "Next, break the user's high-level request into a numbered sequence of "
+            "concrete, executable steps. Each step MUST include: "
+            "(1) a clear instruction for the code_agent "
+            "(2) any parameters or file names needed, and "
+            "(3) explicit completion criteria. You are the expert in this area, "
+            "so be very clear about the details and instructions so the code_agent doesn't "
+            "have to fill in too many blanks. "
+            "Your plan should not be overly complex -- accomplish the task in the minimal "
+            "number of steps necessary. Do NOT ask the agent to write scaffolding files first. " 
+            "Do NOT ask the agent not use a virtual environment or git repo or install anyything."
+            ""
+            "Then you must delegate the *first* step to `code_agent` and "
+            "wait for its report. When a step is reported complete, mark it as "
+            "done ✅ and delegate the next. Repeat until all steps are finished. "
+            "For the Second step and beyond, the code_agent does not know of any "
+            "previous work so be sure to give complete and verbose context. "
+            "NEVER call final_answer until all steps are reported ✅ complete by "
+            "code_agent. If you think work is finished, first verify each "
+            "criterion, then call final_answer.")
+
+        tools_manager = [
+            MakePlan(), FinalAnswer()
+        ]
+        if args.confirm_plan:
+            tools_manager.append(GetUserInput())
+
+        agent = Agent(tools=tools_manager,
+                        model=model,
+                        system_message=manager_prompt,
+                        managed_agents=[agent_code],
+                        max_steps=25,
+                        verbosity=args.verbosity,
+                        name="manager_agent",
+                        description="Magnages coding agents")
+    
+        if args.confirm_plan:
+                manager_prompt+="\n\nAfter creating the plan, ask the user for any further changes or approval."
+
+        # agent = _build_default_agent(debug=args.debug,
+        #                             local=args.local,
+        #                             confirm_edits=args.confirm_edits,
+        #                             oai_model=args.model)
+
+        
     result = agent.run(user_task)
     print("\n=== FINAL ANSWER ===\n", result)
 
     # optional interactive loop -------------------------------------------
-    while True:
+    while True and not args.end:
         follow = input("Feedback (or 'end'): ").strip()
         if follow.lower() == "end":
             break
         agent.max_steps += 20  # give more budget
         print(agent.run(follow, reset=False))
+
+    if args.wkdir:
+        os.chdir(cwd)
 
 
 if __name__ == "__main__":  # pragma: no cover

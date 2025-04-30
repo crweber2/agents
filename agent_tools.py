@@ -534,9 +534,10 @@ class ListFiles(Tool):
 class ViewImage(Tool):
     """
     Encode a local image as a data-URI so the model can inspect it.
+    Automatically resizes the image to 512px width while maintaining aspect ratio.
     """
     name = "view_image"
-    description = """Load a local image and return a base64 data‑URI so the model can inspect it.
+    description = """Load a local image, resize it to 512px width, and return a base64 data‑URI so the model can inspect it.
 
     When to use:
     - Show the model screenshots, plots, or photos stored on disk.
@@ -551,6 +552,7 @@ class ViewImage(Tool):
     }
 
     Special notes:
+    - Images are automatically resized to 512px width while maintaining aspect ratio.
     - Large images may be truncated by upstream token limits.
     """
     inputs = {
@@ -564,11 +566,42 @@ class ViewImage(Tool):
     def forward(self, *, filename: str) -> str:  # noqa: D401
         if not os.path.isfile(filename):
             return f"File not found: {filename}"
-        mime, _ = mimetypes.guess_type(filename)
-        if mime is None:
-            mime = "image/png"
-        with open(filename, "rb") as fp:
-            data64 = base64.b64encode(fp.read()).decode()
+        
+        try:
+            # Try to import PIL for image resizing
+            from PIL import Image
+            import io
+            
+            # Open the image and resize to 512px width, maintaining aspect ratio
+            img = Image.open(filename)
+            width, height = img.size
+            new_width = 512
+            new_height = int(height * (new_width / width))
+            img = img.resize((new_width, new_height), Image.LANCZOS)
+            
+            # Save to a BytesIO buffer
+            buffer = io.BytesIO()
+            img.save(buffer, format=img.format or "PNG")
+            buffer.seek(0)
+            image_data = buffer.read()
+            
+            # Get mime type
+            mime, _ = mimetypes.guess_type(filename)
+            if mime is None:
+                mime = f"image/{img.format.lower()}" if img.format else "image/png"
+            
+            # Encode to base64
+            data64 = base64.b64encode(image_data).decode()
+            
+        except ImportError:
+            # Fallback if PIL is not available
+            LOGGER.warning("PIL not available, serving original image without resizing")
+            mime, _ = mimetypes.guess_type(filename)
+            if mime is None:
+                mime = "image/png"
+            with open(filename, "rb") as fp:
+                data64 = base64.b64encode(fp.read()).decode()
+        
         return f"data:{mime};base64,{data64}"
 
 class MakePlan(Tool):

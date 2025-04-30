@@ -34,6 +34,9 @@ if __name__ == "__main__":
                         help="Ask for confirmation after making initial plan")
     parser.add_argument( "--end", action="store_true", 
                         help="End on first final_answer")
+    parser.add_argument("-m1", "--model1", default="o3", help="OpenAI manager model")
+    parser.add_argument("-m2", "--model2", default="gpt-4.1", help="OpenAI executer model")
+
 
     cli_args = parser.parse_args()
 
@@ -56,11 +59,11 @@ if __name__ == "__main__":
         )
     else:
         model_executor = LLMClient(
-            model_id="gpt-4.1",
+            model_id=cli_args.model2,
             debug=cli_args.debug,
         )
         # ––– Planner uses the stronger "o3" model (always OpenAI for now) –––
-        model_planner = LLMClient(model_id="o3", temperature=1, debug=cli_args.debug)
+        model_planner = LLMClient(model_id=cli_args.model1, temperature=1, debug=cli_args.debug)
 
     # ------------------ (2e)  Get the initial user task --------------------
 
