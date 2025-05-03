@@ -128,6 +128,7 @@ class ChatMessage:
     name: str | None = None
     tool_call_id: str | None = None
     tool_calls: Any | None = None  # populated for assistant messages
+    usage: Any | None = None  # stores token usage information
 
     # ---------------------------------------------------------------------
     # Factory helpers
@@ -374,7 +375,11 @@ class LLMClient:
             LOGGER.info("Sending request → %s", self.model_id)
         resp = self.client.chat.completions.create(model=self.model_id, messages=messages, tools=tools or None,
                                                    tool_choice="auto" if tools else None, temperature=self.temperature)
-        return resp.choices[0].message
+        # Attach usage information to the message object so it's available for token counting display
+        message = resp.choices[0].message
+        if hasattr(resp, 'usage'):
+            message.usage = resp.usage
+        return message
 
 ###############################################################################
 # Regex patterns to salvage malformed tool calls
@@ -575,6 +580,11 @@ class Agent:
                 role = msg.role.upper()
                 content = msg.content or ""
                 
+                # Write separator between messages
+                separator = "-" * 80
+                if idx > 1:
+                    f.write(f"\n{separator}\n\n")
+                
                 if msg.role == "assistant":
                     f.write(f"[{idx}] {role} [{self.name}]:\n{content}\n")
                     if msg.tool_calls:
@@ -619,11 +629,16 @@ class Agent:
                             f.write(f"    }}\n")
                             f.write(f"  }}\n")
                         f.write("]\n")
+                                            
+                    # Add token count if available
+                    if hasattr(msg, 'usage') and msg.usage:
+                        tokens_used = getattr(msg.usage, 'total_tokens', 'unknown')
+                        f.write(f"[TOKENS: {tokens_used}]\n")
+                    
                 elif msg.role == "tool":
                     f.write(f"[{idx}] TOOL RESPONSE from {msg.name}:\n{content}\n")
                 else:
                     f.write(f"[{idx}] {role}:\n{content}\n")
-                f.write("\n")
         self._log(f"Trace dumped to {fname}", 3)
 
     # ------------------------------------------------------------------
@@ -668,11 +683,14 @@ class Agent:
                 tool_calls = maybe_calls
                 response_content = None
         assistant_msg = ChatMessage.assistant(response_content, tool_calls=tool_calls)
+        # Transfer usage information from API response to our ChatMessage object
+        if hasattr(msg, 'usage'):
+            assistant_msg.usage = msg.usage
         self.memory.append(assistant_msg)
         if self.verbosity >= 2 and _console is not None:
             _console.print(assistant_msg._pretty())
             if hasattr(msg, 'usage') and msg.usage:
-                tokens_used = msg.usage.get('total_tokens', 'unknown')
+                tokens_used = getattr(msg.usage, 'total_tokens', 'unknown')
                 _console.print(f"[dim]Tokens used this step: {tokens_used}[/dim]")
         # ---- dispatch tool calls --------------------------------------
         if not tool_calls:  # No tool was called - instruct agent to use a tool
@@ -704,15 +722,25 @@ class Agent:
             except Exception as exc:  # pragma: no cover - runtime errors
                 result = f"ToolError[{name}]: {exc} ({traceback.format_exc().splitlines()[-1]})"
             
+            content_for_log = str(result)
+
             # Capture any image data-URI returned by tools
             if (getattr(target, "output_type", "") == "image"
                 and isinstance(result, str)
                 and result.startswith("data:image")):
                 image_parts.append(
-                    {"type": "image_url", "image_url": {"url": result}}
+                    {"type": "image_url",
+                    "image_url": {"url": result, 
+                                  "detail": "auto"}} # or low/high
                 )
-            
-            self.memory.append(ChatMessage.tool(name=name, tool_call_id=tc.get("id", "call_0"), result=str(result)))
+                basename = os.path.basename(args.get("filename", "image"))
+                content_for_log = f"<{basename} • {len(result):,} chars>"
+
+            self.memory.append(ChatMessage.tool(
+                name=name,
+                tool_call_id=tc.get("id", "call_0"),
+                result=content_for_log))
+                
             if name == "final_answer":
                 final_answer = args.get("answer", str(result))
             if self.verbosity >= 2 and _console is not None:
