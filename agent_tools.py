@@ -1,5 +1,4 @@
-"""
-Agent Tools Module.
+"""Agent Tools Module.
 
 This module provides a collection of tool classes used by the Agent class to perform
 various operations on files, execute code, and interact with the system. These tools
@@ -15,6 +14,7 @@ Key components:
 - Delete: Remove files or directories
 - ListFiles: List directory contents
 - ViewImage: Display images to the agent
+- ReadPDF: Read PDF files with full page images for complex content
 - MakePlan: Create step-by-step plans
 - FinalAnswer: Return final answers to the user
 - GetUserInput: Request information from the user
@@ -531,6 +531,252 @@ class ListFiles(Tool):
             return f"Directory not found: {path}"
 
 
+class ReadPDF_txtimg(Tool):
+    name = "read_pdf"
+    description = """Extract text content and page images from PDF files.
+
+    When to use:
+    - Extract text from PDF documents
+    - View full page images for PDFs with complex content like formulas, tables, or diagrams
+    - Analyze scientific papers or technical documents with mixed content
+
+    Parameters:
+    - filename [string] REQUIRED - path to the PDF file
+    - page     [integer] OPTIONAL - specific page number to extract (1-based indexing); omit for all pages
+    - image_only [boolean] OPTIONAL - if true, only returns page images without text extraction
+
+    Usage example:
+    {
+      "tool": "read_pdf",
+      "args": { 
+        "filename": "documents/paper.pdf",
+        "page": 3,
+        "image_only": true
+      }
+    }
+
+    Special notes:
+    - Returns both extracted text and base64-encoded page images
+    - For complex content like math equations or diagrams, use image_only=true
+    - Large PDFs may be limited to prevent excessive token usage
+    """
+    inputs = {
+        "filename": {"type": "string", "description": "Path to the PDF file"},
+        "page": {"type": "integer", "description": "Specific page to extract (1-based indexing, optional)"},
+        "image_only": {"type": "boolean", "description": "If true, only returns page images without text"}
+    }
+    output_type = "object"
+
+    def forward(self, *, filename: str, page: int = None, image_only: bool = True) -> Dict[str, Any]:
+        """
+        Extract text and images from a PDF file
+        
+        Args:
+            filename: Path to the PDF file
+            page: Specific page to extract (1-based indexing); None for all pages
+            image_only: If true, only returns page images without text extraction
+            
+        Returns:
+            Dictionary with 'text' and 'images' keys
+        """
+        if not os.path.isfile(filename):
+            return {"error": f"File not found: {filename}"}
+            
+        try:
+            # Import the required libraries
+            import pypdf
+            from pdf2image import convert_from_path
+            from PIL import Image
+            import io
+            
+            result = {"text": [], "images": []}
+            
+            # Extract text using PyPDF if not image_only
+            if not image_only:
+                try:
+                    pdf_reader = pypdf.PdfReader(filename)
+                    
+                    # Handle specific page or all pages
+                    pages_to_process = [page-1] if page is not None else range(len(pdf_reader.pages))
+                    
+                    for page_num in pages_to_process:
+                        if 0 <= page_num < len(pdf_reader.pages):
+                            page_obj = pdf_reader.pages[page_num]
+                            text = page_obj.extract_text()
+                            result["text"].append({
+                                "page": page_num + 1,
+                                "content": text
+                            })
+                except Exception as e:
+                    result["text_error"] = f"Error extracting text: {str(e)}"
+            
+            # Extract images using pdf2image
+            try:
+                # Convert specific page or all pages
+                if page is not None:
+                    images = convert_from_path(filename, first_page=page, last_page=page)
+                else:
+                    images = convert_from_path(filename)
+                
+                # Process each image
+                for i, img in enumerate(images):
+                    # Calculate the page number
+                    page_number = page if page is not None else i + 1
+                    
+                    # # Resize image to a reasonable width while maintaining aspect ratio
+                    # width, height = img.size
+                    # new_width = min(1024, width)  # Limit width to 1024px max
+                    # if width > new_width:
+                    #     new_height = int(height * (new_width / width))
+                    #     img = img.resize((new_width, new_height), Image.LANCZOS)
+                    
+                    # Convert to base64
+                    buffer = io.BytesIO()
+                    img.save(buffer, format="JPEG", quality=85)  # Use JPEG with good quality for smaller size
+                    buffer.seek(0)
+                    img_base64 = base64.b64encode(buffer.read()).decode('utf-8')
+                    
+                    result["images"].append({
+                        "page": page_number,
+                        "width": img.width,
+                        "height": img.height,
+                        "data": f"data:image/jpeg;base64,{img_base64}"
+                    })
+            except Exception as e:
+                result["image_error"] = f"Error extracting images: {str(e)}"
+            
+            return result
+            
+        except ImportError as e:
+            missing_lib = str(e).split("'")[1] if "'" in str(e) else str(e)
+            return {
+                "error": f"Missing required library: {missing_lib}. Please install with: pip install pypdf pdf2image pillow"
+            }
+        except Exception as e:
+            return {"error": f"Error processing PDF: {str(e)}"}
+
+
+
+class ReadPDF_notxt(Tool):
+    name = "read_pdf"
+    description = """Extract pages from PDF.
+
+    When to use:
+    - Extract text and images from PDF documents
+    - View full page images for PDFs with complex content like formulas, tables, or diagrams
+    - Analyze scientific papers or technical documents with mixed content
+
+    Parameters:
+    - filename [string] REQUIRED - path to the PDF file
+
+    Usage example:
+    {
+      "tool": "read_pdf",
+      "args": { 
+        "filename": "documents/paper.pdf"
+      }
+    }
+
+    Special notes:
+    - Returns full-page base64-encoded page images
+    """
+    inputs = {
+        "filename": {"type": "string", "description": "Path to the PDF file"},
+        # "page": {"type": "integer", "description": "Specific page to extract (1-based indexing, optional)"},
+        # "image_only": {"type": "boolean", "description": "If true, only returns page images without text"}
+    }
+    output_type = "object"
+
+    def forward(self, *, filename: str) -> Dict[str, Any]:
+        """
+        Extract text and images from a PDF file
+        
+        Args:
+            filename: Path to the PDF file
+            
+        Returns:
+            Dictionary with 'images' key
+        """
+        page = None
+        image_only = True
+        if not os.path.isfile(filename):
+            return {"error": f"File not found: {filename}"}
+            
+        try:
+            # Import the required libraries
+            import pypdf
+            from pdf2image import convert_from_path
+            from PIL import Image
+            import io
+            
+            result = {"text": [], "images": []}
+            
+            # Extract text using PyPDF if not image_only
+            if not image_only:
+                try:
+                    pdf_reader = pypdf.PdfReader(filename)
+                    
+                    # Handle specific page or all pages
+                    pages_to_process = [page-1] if page is not None else range(len(pdf_reader.pages))
+                    
+                    for page_num in pages_to_process:
+                        if 0 <= page_num < len(pdf_reader.pages):
+                            page_obj = pdf_reader.pages[page_num]
+                            text = page_obj.extract_text()
+                            result["text"].append({
+                                "page": page_num + 1,
+                                "content": text
+                            })
+                except Exception as e:
+                    result["text_error"] = f"Error extracting text: {str(e)}"
+            
+            # Extract images using pdf2image
+            try:
+                # Convert specific page or all pages
+                if page is not None:
+                    images = convert_from_path(filename, first_page=page, last_page=page)
+                else:
+                    images = convert_from_path(filename)
+                
+                # Process each image
+                for i, img in enumerate(images):
+                    # Calculate the page number
+                    page_number = page if page is not None else i + 1
+                    
+                    # # Resize image to a reasonable width while maintaining aspect ratio
+                    # width, height = img.size
+                    # new_width = min(1024, width)  # Limit width to 1024px max
+                    # if width > new_width:
+                    #     new_height = int(height * (new_width / width))
+                    #     img = img.resize((new_width, new_height), Image.LANCZOS)
+                    
+                    # Convert to base64
+                    buffer = io.BytesIO()
+                    img.save(buffer, format="JPEG", quality=85)  # Use JPEG with good quality for smaller size
+                    buffer.seek(0)
+                    img_base64 = base64.b64encode(buffer.read()).decode('utf-8')
+                    
+                    result["images"].append({
+                        "page": page_number,
+                        "width": img.width,
+                        "height": img.height,
+                        "data": f"data:image/jpeg;base64,{img_base64}"
+                    })
+            except Exception as e:
+                result["image_error"] = f"Error extracting images: {str(e)}"
+            
+            return result
+            
+        except ImportError as e:
+            missing_lib = str(e).split("'")[1] if "'" in str(e) else str(e)
+            return {
+                "error": f"Missing required library: {missing_lib}. Please install with: pip install pypdf pdf2image pillow"
+            }
+        except Exception as e:
+            return {"error": f"Error processing PDF: {str(e)}"}
+
+ReadPDF = ReadPDF_notxt
+
 class ViewImage(Tool):
     """
     Encode a local image as a data-URI so the model can inspect it.
@@ -567,42 +813,43 @@ class ViewImage(Tool):
         if not os.path.isfile(filename):
             return f"File not found: {filename}"
         
-        try:
-            # Try to import PIL for image resizing
-            from PIL import Image
-            import io
+        # try:
+        #     # Try to import PIL for image resizing
+        #     from PIL import Image
+        #     import io
             
-            # Open the image and resize to 512px width, maintaining aspect ratio
-            img = Image.open(filename)
-            width, height = img.size
-            new_width = 512
-            new_height = int(height * (new_width / width))
-            img = img.resize((new_width, new_height), Image.LANCZOS)
+        #     # Open the image and resize to 512px width, maintaining aspect ratio
+        #     img = Image.open(filename)
+        #     width, height = img.size
+        #     new_width = 512
+        #     new_height = int(height * (new_width / width))
+        #     img = img.resize((new_width, new_height), Image.LANCZOS)
             
-            # Save to a BytesIO buffer
-            buffer = io.BytesIO()
-            img.save(buffer, format=img.format or "PNG")
-            buffer.seek(0)
-            image_data = buffer.read()
+        #     # Save to a BytesIO buffer
+        #     buffer = io.BytesIO()
+        #     img.save(buffer, format=img.format or "PNG")
+        #     buffer.seek(0)
+        #     image_data = buffer.read()
             
-            # Get mime type
-            mime, _ = mimetypes.guess_type(filename)
-            if mime is None:
-                mime = f"image/{img.format.lower()}" if img.format else "image/png"
+        #     # Get mime type
+        #     mime, _ = mimetypes.guess_type(filename)
+        #     if mime is None:
+        #         mime = f"image/{img.format.lower()}" if img.format else "image/png"
             
-            # Encode to base64
-            data64 = base64.b64encode(image_data).decode()
+        #     # Encode to base64
+        #     data64 = base64.b64encode(image_data).decode()
             
-        except ImportError:
-            # Fallback if PIL is not available
-            LOGGER.warning("PIL not available, serving original image without resizing")
-            mime, _ = mimetypes.guess_type(filename)
-            if mime is None:
-                mime = "image/png"
-            with open(filename, "rb") as fp:
-                data64 = base64.b64encode(fp.read()).decode()
+        # except ImportError:
+        #     # Fallback if PIL is not available
+        #     LOGGER.warning("PIL not available, serving original image without resizing")
+        mime, _ = mimetypes.guess_type(filename)
+        if mime is None:
+            mime = "image/png"
+        with open(filename, "rb") as fp:
+            data64 = base64.b64encode(fp.read()).decode()
         
         return f"data:{mime};base64,{data64}"
+
 
 class MakePlan(Tool):
     name = "make_plan"

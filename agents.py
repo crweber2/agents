@@ -43,6 +43,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import textwrap
 import traceback
 import uuid
@@ -54,7 +55,7 @@ from typing import (Any, Callable, Dict, Iterable, List, Mapping, MutableMapping
 from agent_tools import (
     Tool, WriteFile, ReadFile, EditFile, Delete, RunPython,
     RunBash, ViewImage, ListFiles, MakePlan, FinalAnswer, GetUserInput,
-    truncate, authorized_types, _RE_TRAILING_COMMA
+    ReadPDF, truncate, authorized_types, _RE_TRAILING_COMMA
 )
 
 # 3rd-party ------------------------------------------------------------------
@@ -366,7 +367,7 @@ class LLMClient:
         self.model_id = model_id
         self.temperature = temperature
         self.debug = debug
-        if self.model_id == 'o3':
+        if self.model_id.startswith('o'):
             self.temperature = 1.0
 
     # ------------------------------------------------------------------
@@ -636,9 +637,39 @@ class Agent:
                         f.write(f"[TOKENS: {tokens_used}]\n")
                     
                 elif msg.role == "tool":
+                    # # For tool responses, if it's view_image or read_pdf, handle specially
+                    # if msg.name in ["view_image", "read_pdf"]:
+                    #     # Show the formatted summary instead of raw data
+                    #     sanitized_content = content
+                    #     if msg.name == "view_image" and content.startswith("data:image"):
+                    #         sanitized_content = f"<image data - {len(content):,} characters>"
+                    #     f.write(f"[{idx}] TOOL RESPONSE from {msg.name}:\n{sanitized_content}\n")
+                    # else:
                     f.write(f"[{idx}] TOOL RESPONSE from {msg.name}:\n{content}\n")
                 else:
-                    f.write(f"[{idx}] {role}:\n{content}\n")
+                    # Handle user messages, which might contain image data
+                    if msg.role == "user" and isinstance(content, list):
+                        # This is likely multimodal content with images
+                        f.write(f"[{idx}] {role}:\n")
+                        
+                        # Process each content part
+                        for part in content:
+                            if isinstance(part, dict):
+                                if part.get("type") == "text":
+                                    # For text parts, show the actual text
+                                    f.write(f"[Text content]: {part.get('text', '')}\n")
+                                elif part.get("type") == "image_url":
+                                    # For image parts, just show a placeholder
+                                    image_url = part.get("image_url", {}).get("url", "")
+                                    if image_url.startswith("data:image"):
+                                        f.write(f"[Image content]: <image data - {len(image_url):,} characters>\n")
+                                    else:
+                                        f.write(f"[Image content]: {image_url}\n")
+                                else:
+                                    f.write(f"[Other content type: {part.get('type', 'unknown')}]\n")
+                    else:
+                        # Regular user message with plain text
+                        f.write(f"[{idx}] {role}:\n{content}\n")
         self._log(f"Trace dumped to {fname}", 3)
 
     # ------------------------------------------------------------------
@@ -735,6 +766,45 @@ class Agent:
                 )
                 basename = os.path.basename(args.get("filename", "image"))
                 content_for_log = f"<{basename} • {len(result):,} chars>"
+            # Handle PDF results which contain both text and images
+            elif (getattr(target, "output_type", "") == "object" 
+                  and isinstance(result, dict) 
+                  and "images" in result):
+                # Extract images from PDF result
+                pdf_images = result.get("images", [])
+                
+                # First add any text content as a text element
+                if "text" in result and result["text"]:
+                    text_blocks = []
+                    for text_item in result["text"]:
+                        if "page" in text_item and "content" in text_item:
+                            page_num = text_item["page"]
+                            content = text_item["content"].strip()
+                            if content:  # Only add non-empty text
+                                text_blocks.append(f"Page {page_num}:\n{content}")
+                    
+                    if text_blocks:
+                        # Add text content first in the image_parts array
+                        image_parts.append({
+                            "type": "text", 
+                            "text": "Extracted PDF Text:\n\n" + "\n\n".join(text_blocks)
+                        })
+                
+                # Then add all images to the same array
+                for img_data in pdf_images:
+                    if "data" in img_data and img_data["data"].startswith("data:image"):
+                        image_parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": img_data["data"], 
+                                          "detail": "auto"}
+                        })
+                
+                # Create a log-friendly version that summarizes the content
+                filename = args.get("filename", "document.pdf")
+                page_info = f"page {args.get('page', 'all')}" if "page" in args else "all pages"
+                text_count = len(result.get("text", []))
+                img_count = len(pdf_images)
+                content_for_log = f"<PDF: {os.path.basename(filename)} • {page_info} • {text_count} text blocks, {img_count} images>"
 
             self.memory.append(ChatMessage.tool(
                 name=name,
@@ -746,9 +816,9 @@ class Agent:
             if self.verbosity >= 2 and _console is not None:
                 _console.print(self.memory[-1]._pretty())
 
-            # Feed images back to the model so it can "see" them
-            if image_parts:
-                self.memory.append(ChatMessage.user(image_parts))
+        # Feed images back to the model so it can "see" them
+        if image_parts:
+            self.memory.append(ChatMessage.user(image_parts))
 
         return final_answer
 
@@ -841,6 +911,7 @@ def _build_default_agent(debug: bool, local: bool, confirm_edits: bool = False, 
         RunPython(), 
         RunBash(), 
         ViewImage(),
+        ReadPDF(),     # Add PDF reading tool
         ListFiles(), 
         MakePlan(), 
         GetUserInput(),
@@ -859,6 +930,7 @@ def main() -> None:  # noqa: D401
                         help="Verbosity level: 0-quiet 1-steps 2-rich 3-trace (default 2)")
     parser.add_argument("-m", "--model", default="gpt-4.1", help="OpenAI model")
     parser.add_argument("-w", "--wkdir", action="store_true", help="move to work dir")
+    parser.add_argument("--cp", default="", help="Copy file or directory to wkdir")
     parser.add_argument("-c", "--confirm-edits", action="store_true", 
                         help="Require confirmation before editing or deleting files")
     parser.add_argument("--confirm-plan", action="store_true", 
@@ -892,6 +964,25 @@ def main() -> None:  # noqa: D401
         workdir = os.path.join(cwd,'work/tmp_'+_dt.datetime.now().strftime('%y%m%d_%H%M'))
         os.makedirs(workdir,exist_ok=True)
         print(f'moving to {workdir}')
+        
+        # Handle --cp flag if it's provided
+        if args.cp:
+            source_path = args.cp
+            if os.path.exists(source_path):
+                dest_name = os.path.basename(source_path)
+                dest_path = os.path.join(workdir, dest_name)
+                
+                if os.path.isdir(source_path):
+                    # For directories, use copytree
+                    print(f'copying directory {source_path} to {dest_path}')
+                    shutil.copytree(source_path, dest_path)
+                else:
+                    # For files, use copy2 (preserves metadata)
+                    print(f'copying file {source_path} to {dest_path}')
+                    shutil.copy2(source_path, dest_path)
+            else:
+                print(f'Warning: Source path {source_path} not found, skipping copy')
+        
         os.chdir(workdir)
 
     tools_all = [
@@ -899,6 +990,8 @@ def main() -> None:  # noqa: D401
         RunBash(), Delete(confirm_edits=args.confirm_edits),
         MakePlan(), ListFiles(), FinalAnswer()
     ]
+    if not args.multi:
+        tools_all.insert(-1,ReadPDF())
     if args.vision:
         tools_all.insert(-1,ViewImage())
 
@@ -914,7 +1007,9 @@ def main() -> None:  # noqa: D401
                     verbosity=args.verbosity,
                     name="code_agent",
                     description="Writes/tests Python projects")
+    
     if args.multi:
+        # remove read_pdf from tools_all, leave that to manager
         agent_code = agent
         agent_code.clear_memory_on_run = True
 
@@ -945,6 +1040,10 @@ def main() -> None:  # noqa: D401
         tools_manager = [
             MakePlan(), FinalAnswer()
         ]
+        if args.vision:
+            tools_all.insert(-1,ReadPDF())
+            tools_all.insert(-1,ViewImage())
+
         if args.confirm_plan:
             tools_manager.append(GetUserInput())
 
@@ -979,7 +1078,6 @@ def main() -> None:  # noqa: D401
 
     if args.wkdir:
         os.chdir(cwd)
-
 
 if __name__ == "__main__":  # pragma: no cover
     main()
