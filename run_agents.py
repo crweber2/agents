@@ -147,8 +147,7 @@ if __name__ == "__main__":
         managed_agents=[mentor_agent],   # Give executor access to the mentor
         name="executor_agent",
         description="Executes a single step using the provided tool belt and returns the observation.",
-        clear_memory_on_run=True,  # Starts with a clean memory for each task
-
+        #clear_memory_on_run=True,  # Starts with a clean memory for each task
     )
 
     # ------------------ (2d)  Build MANAGER (planner) agent ----------------

@@ -284,6 +284,82 @@ class EditFile(Tool):
         return f"Replaced {original.count(search_string)} occurrence(s) in {filename}"
 
 
+APPLY_PATCH_TOOL_DESC = """This is a custom utility that makes it more convenient to add, remove, move, or edit code files. `apply_patch` effectively allows you to execute a diff/patch against a file, but the format of the diff specification is unique to this task, so pay careful attention to these instructions. To use the `apply_patch` command, you should pass a message of the following structure as "input":
+
+%%bash
+apply_patch <<"EOF"
+*** Begin Patch
+[YOUR_PATCH]
+*** End Patch
+EOF
+
+Where [YOUR_PATCH] is the actual content of your patch, specified in the following V4A diff format.
+
+*** [ACTION] File: [path/to/file] -> ACTION can be one of Add, Update, or Delete.
+For each snippet of code that needs to be changed, repeat the following:
+[context_before] -> See below for further instructions on context.
+- [old_code] -> Precede the old code with a minus sign.
++ [new_code] -> Precede the new, replacement code with a plus sign.
+[context_after] -> See below for further instructions on context.
+
+For instructions on [context_before] and [context_after]:
+- By default, show 3 lines of code immediately above and 3 lines immediately below each change. If a change is within 3 lines of a previous change, do NOT duplicate the first change’s [context_after] lines in the second change’s [context_before] lines.
+- If 3 lines of context is insufficient to uniquely identify the snippet of code within the file, use the @@ operator to indicate the class or function to which the snippet belongs. For instance, we might have:
+@@ class BaseClass
+[3 lines of pre-context]
+- [old_code]
++ [new_code]
+[3 lines of post-context]
+
+- If a code block is repeated so many times in a class or function such that even a single @@ statement and 3 lines of context cannot uniquely identify the snippet of code, you can use multiple `@@` statements to jump to the right context. For instance:
+
+@@ class BaseClass
+@@ 	def method():
+[3 lines of pre-context]
+- [old_code]
++ [new_code]
+[3 lines of post-context]
+
+Note, then, that we do not use line numbers in this diff format, as the context is enough to uniquely identify code. An example of a message that you might pass as "input" to this function, in order to apply a patch, is shown below.
+
+%%bash
+apply_patch <<"EOF"
+*** Begin Patch
+*** Update File: pygorithm/searching/binary_search.py
+@@ class BaseClass
+@@     def search():
+-          pass
++          raise NotImplementedError()
+
+@@ class Subclass
+@@     def search():
+-          pass
++          raise NotImplementedError()
+
+*** End Patch
+EOF
+"""
+
+
+class EditFile_patch(Tool):
+    name = "apply_patch"
+    description = APPLY_PATCH_TOOL_DESC #"Apply a context‑based diff to existing files. Uses the \"*** Begin Patch\" V4A format."
+    inputs = {"patch": {"type": "string", "description": "Diff text beginning with *** Begin Patch"}} 
+    output_type = "string"
+
+    def forward(self, *, patch: str) -> str:
+        import subprocess, tempfile, textwrap, os, sys
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            tf.write(textwrap.dedent(patch))
+            tf.flush()
+            try:
+                out = subprocess.check_output(["apply_patch", tf.name], stderr=subprocess.STDOUT, text=True)
+                return out.strip()
+            except subprocess.CalledProcessError as e:
+                return f"Patch failed:\n{e.output}"
+            finally:
+                os.unlink(tf.name)
+
 class RunPython(Tool):
     name = "run_python"
     description = """Execute a Python script in a subprocess and stream stdout/stderr live.
@@ -512,8 +588,11 @@ class ListFiles(Tool):
             entries = os.listdir(path if path else ".")
             # Filter out hidden files (starting with '.') and agent_traces folders
             entries = [entry for entry in entries 
-                      if not entry.startswith('.') and not entry.startswith('agent_traces')]
-            
+                    if not entry.startswith('.') 
+                    and not entry.startswith('agent_traces')
+                    and not entry.startswith('plan')
+                    and not entry.startswith('reflection')]
+
             result = []
             
             # First add directories with trailing slash
@@ -883,6 +962,43 @@ class MakePlan(Tool):
         with open(fname, "w", encoding="utf-8") as fp:
             fp.write(content)
         return f"Plan saved → {fname}"
+
+
+class Reflect(Tool):
+    name = "reflect"
+    description = """Document the agent's reflections on observations before proceeding to the next step.
+
+    When to use:
+    - Between tool steps to analyze observations and determine the next course of action
+    - When encountering unexpected results that require deeper analysis
+    - To document reasoning about complex decisions before proceeding
+
+    Parameters:
+    - content [string] REQUIRED - reflection text containing analysis of observations and reasoning.
+
+    Usage example:
+    {
+      "tool": "reflect",
+      "args": { "content": "After examining the output, I notice that:\\n1. The error occurs in the data loading step\\n2. The file format appears to be incompatible\\n\\nThis suggests we need to implement a different parsing approach." }
+    }
+
+    Special notes:
+    - Files are named *reflection_XX.txt* where *XX* increments safely.
+    - Helps maintain a record of reasoning and decision-making process.
+    """
+    inputs = {"content": {"type": "string", "description": "Reflection content."}}
+    output_type = "string"
+
+    def forward(self, *, content: str) -> str:  # noqa: D401
+        idx = 0
+        while True:
+            fname = f"reflection_{idx:02d}.txt"
+            if not os.path.exists(fname):
+                break
+            idx += 1
+        with open(fname, "w", encoding="utf-8") as fp:
+            fp.write(content)
+        return f"Reflection saved → {fname}"
 
 
 class FinalAnswer(Tool):

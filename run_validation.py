@@ -42,7 +42,7 @@ for test_file in test_files:
         sys.stdout.write(f"\rRunning {test_name} trial {trial+1}/{N_TRIALS}; [{''.join(trial_results)}]")
         sys.stdout.flush()
         
-        proc = subprocess.run(['python', 'run_agents.py','--end', os.path.join(TEST_DIR, test_file)], capture_output=True, text=True)
+        proc = subprocess.run(['python', 'agents.py','--end','-l', '-w',os.path.join(TEST_DIR, test_file)], capture_output=True, text=True)
 
         output_lines = proc.stdout.strip().split('\n')
         if not output_lines:

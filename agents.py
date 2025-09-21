@@ -54,7 +54,7 @@ from typing import (Any, Callable, Dict, Iterable, List, Mapping, MutableMapping
 # local ----------------------------------------------------------------------
 from agent_tools import (
     Tool, WriteFile, ReadFile, EditFile, Delete, RunPython,
-    RunBash, ViewImage, ListFiles, MakePlan, FinalAnswer, GetUserInput,
+    RunBash, ViewImage, ListFiles, MakePlan, Reflect, FinalAnswer, GetUserInput,
     ReadPDF, truncate, authorized_types, _RE_TRAILING_COMMA
 )
 
@@ -91,6 +91,21 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s ▸ %(messa
 # Global configuration flags
 CONFIRM_EDITS = False  # Set to True to enable interactive edit approval workflow
 
+REMINDERS = textwrap.dedent(
+    """\
+    You are an agent - please keep going until the user’s query is completely resolved, 
+    before ending your turn and yielding back to the user. Only terminate your turn when 
+    you are sure that the problem is solved.
+
+    If you are not sure about file content or codebase structure pertaining to the user’s 
+    request, use your tools to read files and gather the relevant information: do NOT 
+    guess or make up an answer.
+
+    You MUST plan extensively before each function call, and reflect extensively on the 
+    outcomes of the previous function calls. DO NOT do this entire process by making 
+    function calls only, as this can impair your ability to solve the problem and think insightfully.
+    """
+)
 ###############################################################################
 # Chat message & memory classes
 ###############################################################################
@@ -256,10 +271,11 @@ class ChatMessage:
                     Text(shown, style="white")
                 ),
                 title="tool",
+                width=100,
                 border_style="blue"
             )
         return Panel(Group(Text(self.role.upper(), style="bold magenta"), Text(self.content or "", style="white")),
-                     border_style="magenta", title=self.role)
+                     border_style="magenta",width=100,title=self.role)
 
 
 class ConversationMemory(MutableSequence[ChatMessage]):
@@ -391,7 +407,11 @@ _PAT_XML = re.compile(r"<TOOL\b[^>]*>(.*?)</TOOL>", re.DOTALL | re.IGNORECASE)
 _PAT_FENCE = re.compile(r"```(?:tool|json)\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 _PAT_FUNC = re.compile(r"TOOL_CALL\s*\(\s*name\s*=\s*['\"]?([\w\-]+)['\"]?\s*,\s*args\s*=\s*(\{.*?\})\s*\)", re.DOTALL | re.IGNORECASE)
 _PAT_BARE_JSON = re.compile(r"(?<![\w\-\"])(\{\s*\"name\"\s*:\s*\".+?\".+?\"arguments\"\s*:\s*\{.*?\}\s*})", re.DOTALL)
-_PATTERNS = [_PAT_BRACKETS, _PAT_XML, _PAT_FENCE, _PAT_FUNC, _PAT_BARE_JSON]
+_PAT_TOOL_CALLS_SPECIAL = re.compile(r"\[TOOL_CALLS\](\w+)<[^>]*>(\{.*?\})", re.DOTALL | re.IGNORECASE) # used by mistral_small sometimes (SPECIAL_32)
+_PAT_TOOL_CALLS_DIRECT = re.compile(r"\[TOOL_CALLS\](\w+)(\{.*?\})", re.DOTALL | re.IGNORECASE)
+_PAT_TOOL_CALLS_ARGS = re.compile(r"\[TOOL_CALLS\](\w+)\[ARGS\](\{.*)", re.DOTALL | re.IGNORECASE)
+_PAT_GPT_OSS = re.compile(r"<\|channel\|>commentary to=functions\.(\w+)\s*<\|constrain\|>json<\|message\|>(\{.*\})", re.DOTALL | re.IGNORECASE)
+_PATTERNS = [_PAT_BRACKETS, _PAT_XML, _PAT_FENCE, _PAT_FUNC, _PAT_BARE_JSON, _PAT_TOOL_CALLS_SPECIAL, _PAT_TOOL_CALLS_DIRECT, _PAT_TOOL_CALLS_ARGS, _PAT_GPT_OSS]
 
 
 def _json_from_blob(blob: str) -> dict[str, Any]:  # noqa: D401
@@ -438,13 +458,70 @@ class Agent:
         managed_agents: Sequence["Agent"] | None = None,
         add_tools_to_system_prompt: bool = True,
         clear_memory_on_run: bool = False,
-        system_message: str = (
-            "You are a highly skilled coding agent.  Your job is to complete "
-            "the tasks assigned to you using the provided tools. When completely "
-            "If the task is non-trivial start with `make_plan`.  Use `final_answer` *only* "
-            "once everything is complete."
-            "If you find yourself struggling with the same problem a couple times, "
-        ),
+        include_function_thoughts: bool = True,
+        system_message: str = textwrap.dedent('''
+            You are a highly skilled coding agent.  Your job is to complete the tasks assigned
+            to you using the provided tools. 
+                                              
+            Your thinking should be thorough and so it's fine if it's very long. You can think 
+            step by step before and after each action you decide to take.
+          
+            You MUST iterate and keep going until the problem is solved.
+
+            Only terminate your turn when you are sure that the problem 
+            is solved. Go through the problem step by step, and make sure 
+            to verify that your solution or changes are correct. 
+            NEVER end your turn without having solved the problem, 
+            and when you say you are going to make a tool call, make 
+            sure you ACTUALLY make the tool call, instead of ending your turn.
+                                                        
+            Take your time and think through every step - remember to check your 
+            solution rigorously. It is better to make incremental changes, test, and improve,
+            rather than start with a very compelx solution.
+
+            You MUST plan extensively before each step, and 
+            reflect extensively on the outcomes of the previous function calls.
+
+            # Workflow
+
+            ## High-Level Problem Solving Strategy
+
+            1. Understand the problem deeply. Carefully read the issue and think critically about what is required. Restate the completion criteria.
+            2. Develop a clear, step-by-step plan. Break down the task into manageable, incremental sub-tasks and steps.
+            3. For each task, implement the solution incrementally. Make small, testable code changes.
+            4. Debug as needed. Use debugging techniques to isolate and resolve issues.
+            5. Test frequently. Run tests after each change to verify correctness.
+            6. After you belive you are finished with a tasks, restate the completion critera one-by-one and verify if each is complete.
+
+            Refer to the detailed sections below for more information on each step.
+
+            ## 1. Deeply Understand the Problem
+            Carefully read the issue and think hard about a plan to solve it before coding.
+
+            ## 2. Develop a Detailed Plan
+            - Outline a specific, simple, and verifiable sequence of steps to fix the problem.
+            - Break down the task into into small, incremental steps.
+            - For each tasks, identify completion critera
+
+            ## 3. Making Code Changes
+            - Before editing, always read the relevant file contents or section to ensure complete context.
+            - If a patch is not applied correctly, attempt to reapply it.
+            - Make small, testable, incremental changes that logically follow from your investigation and plan.
+
+            ## 4. Debugging
+            - Make code changes only if you have high confidence they can solve the problem
+            - When debugging, try to determine the root cause rather than addressing symptoms
+            - Debug for as long as needed to identify the root cause and identify a fix
+            - Use print statements, logs, or temporary code to inspect program state, including descriptive statements or error messages to understand what's happening
+            - To test hypotheses, you can also add test statements or functions
+            - Do no make new versions of files (eg *_v2.py, *_v2_final.py) unless necessary. Just edit the files.
+            - Revisit your assumptions if unexpected behavior occurs.
+
+            ## 7. Final Verification
+            - Confirm that all completion criteria are completed
+            - If applicable, view any image that are produced to make sure they look as expected
+            - Iterate until you are extremely confident the solution is complete and correct.
+            '''),
     ) -> None:
         self.name = name
         self.description = description or ""
@@ -467,6 +544,7 @@ class Agent:
         self.planning_interval = planning_interval
         self.memory_threshold = memory_threshold
         self.clear_memory_on_run = clear_memory_on_run
+        self.include_function_thoughts = include_function_thoughts
         
         # Add inputs/output_type for use as a tool (when this agent is called by another agent)
         self.inputs = {
@@ -498,10 +576,12 @@ class Agent:
         for local_step in range(1, self.max_steps + 1):
             self._increment_master_step()
             if self.planning_interval and (local_step == 1 or (local_step - 1) % self.planning_interval == 0):
-                plan_prompt = ("Draft a plan for {{ task }}" if local_step == 1 else "Plan update - {{ remaining_steps }} steps left.")
-                self.memory.append(ChatMessage.user(self._populate(plan_prompt, task=task, remaining_steps=self.max_steps - local_step)))
-                _ = self._take_action()
-            answer = self._take_action()
+                # plan_prompt = ("Draft a plan for {{ task }}" if local_step == 1 else "Plan update - {{ remaining_steps }} steps left.")
+                # self.memory.append(ChatMessage.user(self._populate(plan_prompt, task=task, remaining_steps=self.max_steps - local_step)))
+                # _ = self._take_action()
+                answer = self._take_action()
+            else:
+                answer = self._take_action(specific_tools=['make_plan'])
             
             # Write memory trace to file if verbosity level is high enough
             if self.verbosity >= 3:
@@ -674,17 +754,28 @@ class Agent:
 
     # ------------------------------------------------------------------
     def _build_system_prompt(self, base: str, add_tools: bool) -> str:  # noqa: D401
-        if not add_tools:
-            return base
-        lines = [base, "", "Here are your tools:"]
+        # if not add_tools:
+        #     return base
+        # lines = [base, "", "Here are your tools:"]
         
+        # Pre‑prepend the three reminders so they are always first
+        # base_with_reminders = REMINDERS + "\n" + base
+        base_with_reminders = base
+
+
+        if not add_tools:
+            return base_with_reminders
+
+        lines = [base_with_reminders, "", "Here are your tools:"]
+
         # Regular tools first
         for tool in self.tools.values():
             # Skip managed agents - they'll be handled separately
             if tool in self.managed_agents.values():
                 continue
             inp = ", ".join(f"{k}: {v['type']}" for k, v in tool.inputs.items()) or "None"
-            lines.append(f"- {tool.name}: {tool.description} (inputs: {inp})")
+            # lines.append(f"- {tool.name}: {tool.description} (inputs: {inp})")
+            lines.append(f"- {tool.name}: (inputs: {inp})")
         
         # Add managed agents section if we have any
         if self.managed_agents:
@@ -701,18 +792,43 @@ class Agent:
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
-    def _take_action(self) -> str | None:  # noqa: D401 - returns final answer or None
+    def _take_action(self,specific_tools=None) -> str | None:  # noqa: D401 - returns final answer or None
         """Send current memory to LLM, execute any tool calls, append responses."""
         # ---- call the model -------------------------------------------
-        msg = self.model.chat(messages=self.memory.to_openai(), tools=[self._tool_to_openai(t) for t in self.tools.values()])
+        if specific_tools is None:
+            tools = [self._tool_to_openai(t) for t in self.tools.values()]
+        else:
+            tools = [self._tool_to_openai(t) for t in self.tools.values() if t.name in specific_tools]
+        msg = self.model.chat(messages=self.memory.to_openai(), tools=tools)#[self._tool_to_openai(t) for t in self.tools.values()])
         response_content = msg.content
         # tool_calls = getattr(msg, "tool_calls", None)
         tool_calls = _normalise_tool_calls(getattr(msg, "tool_calls", None))
+        
+        # Handle thought pieces before tool calls if enabled
         if tool_calls is None:  # fallback to regex salvage
-            maybe_calls = self._extract_tool_calls(response_content or "")
-            if maybe_calls:
-                tool_calls = maybe_calls
-                response_content = None
+            if self.include_function_thoughts:
+                # Check if this response has thought pieces before tool calls
+                thought_part, tool_call_part = self._split_response_with_thoughts(response_content or "")
+                
+                if thought_part and tool_call_part:
+                    # Extract tool calls from the tool call part
+                    maybe_calls = self._extract_tool_calls(tool_call_part)
+                    if maybe_calls:
+                        tool_calls = maybe_calls
+                        response_content = thought_part  # Use the thought part as the response content
+                else:
+                    # Try regular extraction on the full content
+                    maybe_calls = self._extract_tool_calls(response_content or "")
+                    if maybe_calls:
+                        tool_calls = maybe_calls
+                        response_content = None
+            else:
+                # Original behavior: extract from full content without splitting
+                maybe_calls = self._extract_tool_calls(response_content or "")
+                if maybe_calls:
+                    tool_calls = maybe_calls
+                    response_content = None
+                    
         assistant_msg = ChatMessage.assistant(response_content, tool_calls=tool_calls)
         # Transfer usage information from API response to our ChatMessage object
         if hasattr(msg, 'usage'):
@@ -722,11 +838,11 @@ class Agent:
             _console.print(assistant_msg._pretty())
             if hasattr(msg, 'usage') and msg.usage:
                 tokens_used = getattr(msg.usage, 'total_tokens', 'unknown')
-                _console.print(f"[dim]Tokens used this step: {tokens_used}[/dim]")
+                _console.print(f"[dim]Tokens used: {tokens_used}[/dim]")
         # ---- dispatch tool calls --------------------------------------
         if not tool_calls:  # No tool was called - instruct agent to use a tool
             self._log("No tool call used, instructing the agent to try again", 1)
-            msg = "You must use a tool call. Use final_answer if you are FINISHED, otherwise use a different tool."
+            msg = "You must use a tool call. Which tool will let you proceed? Use final_answer if you are FINISHED, otherwise use a different tool."
             self.memory.append(ChatMessage.user(msg))
             return None
             
@@ -857,6 +973,37 @@ class Agent:
 
     # ------------------------------------------------------------------
     @staticmethod
+    def _split_response_with_thoughts(text: str) -> tuple[str | None, str | None]:
+        """Split response into thought part and tool call part for any pattern."""
+        if not text:
+            return None, None
+            
+        # Find the earliest tool call pattern match
+        earliest_match = None
+        earliest_start = len(text)
+        
+        for pat in _PATTERNS:
+            for m in pat.finditer(text):
+                if m.start() < earliest_start:
+                    earliest_start = m.start()
+                    earliest_match = m
+                break  # Only need the first match for each pattern
+        
+        if not earliest_match:
+            return None, None
+            
+        # Split at the start of the earliest tool call
+        tool_call_start = earliest_match.start()
+        
+        # Extract the thought part (everything before the tool call)
+        thought_part = text[:tool_call_start].strip()
+        
+        # Extract the tool call part (from the tool call to the end)
+        tool_call_part = text[tool_call_start:].strip()
+        
+        return thought_part if thought_part else None, tool_call_part if tool_call_part else None
+
+    @staticmethod
     def _extract_tool_calls(text: str) -> list[dict[str, Any]]:  # noqa: D401
         calls: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
@@ -867,7 +1014,12 @@ class Agent:
                 if any(max(start, s) < min(end, e) for s, e in spans):
                     continue
                 try:
-                    data = _json_from_blob(m.group(1)) if pat is not _PAT_FUNC else {"name": m.group(1), "arguments": _json_from_blob(m.group(2))}
+                    if pat in (_PAT_TOOL_CALLS_SPECIAL, _PAT_TOOL_CALLS_DIRECT, _PAT_GPT_OSS):
+                        data = {"name": m.group(1), "arguments": json.loads(m.group(2))}
+                    elif pat in (_PAT_FUNC, _PAT_TOOL_CALLS_ARGS):
+                        data = {"name": m.group(1), "arguments": _json_from_blob(m.group(2))}
+                    else:
+                        data = _json_from_blob(m.group(1))
                     name = data.get("name") or data.get("tool") or data.get("function", {}).get("name")
                     args = data.get("arguments") or data.get("args") or data.get("function", {}).get("arguments", {})
                     args_str = args if isinstance(args, str) else json.dumps(args)
@@ -914,6 +1066,7 @@ def _build_default_agent(debug: bool, local: bool, confirm_edits: bool = False, 
         ReadPDF(),     # Add PDF reading tool
         ListFiles(), 
         MakePlan(), 
+        Reflect(),     # Add reflection tool
         GetUserInput(),
         FinalAnswer()
     ]
@@ -988,7 +1141,7 @@ def main() -> None:  # noqa: D401
     tools_all = [
         WriteFile(), ReadFile(), EditFile(confirm_edits=args.confirm_edits), RunPython(),
         RunBash(), Delete(confirm_edits=args.confirm_edits),
-        MakePlan(), ListFiles(), FinalAnswer()
+        MakePlan(), Reflect(), ListFiles(), FinalAnswer()
     ]
     if not args.multi:
         tools_all.insert(-1,ReadPDF())
@@ -998,6 +1151,7 @@ def main() -> None:  # noqa: D401
     model = LLMClient(
         model_id="lmstudio" if args.local else args.model,
         debug=args.debug,
+       # temperature=1.,
         api_base="http://localhost:1234/v1" if args.local else None,
     )
 
@@ -1009,48 +1163,82 @@ def main() -> None:  # noqa: D401
                     description="Writes/tests Python projects")
     
     if args.multi:
-        # remove read_pdf from tools_all, leave that to manager
         agent_code = agent
         agent_code.clear_memory_on_run = True
 
-        manager_prompt = ("You are the *manager_agent* - a senior engineer. Your first "
-            "task is to use the make_plan tool. In the plan you should start with "
-            "Goal: <the overall goal of the task -- restating it in your own words> "
-            "Completion Criteria: <what did the user specify that woiuld complete the task> "
-            "Next, break the user's high-level request into a numbered sequence of "
-            "concrete, executable steps. Each step MUST include: "
-            "(1) a clear instruction for the code_agent "
-            "(2) any parameters or file names needed, and "
-            "(3) explicit completion criteria. You are the expert in this area, "
-            "so be very clear about the details and instructions so the code_agent doesn't "
-            "have to fill in too many blanks. "
-            "Your plan should not be overly complex -- accomplish the task in the minimal "
-            "number of steps necessary. Do NOT ask the agent to write scaffolding files first. " 
-            "Do NOT ask the agent not use a virtual environment or git repo or install anyything."
-            ""
-            "Then you must delegate the *first* step to `code_agent` and "
-            "wait for its report. When a step is reported complete, mark it as "
-            "done ✅ and delegate the next. Repeat until all steps are finished. "
-            "For the Second step and beyond, the code_agent does not know of any "
-            "previous work so be sure to give complete and verbose context. "
-            "NEVER call final_answer until all steps are reported ✅ complete by "
-            "code_agent. If you think work is finished, first verify each "
-            "criterion, then call final_answer.")
+        manager_prompt = textwrap.dedent('''You are the *manager_agent* - a senior engineer. Your first 
+            task is to use the make_plan tool. In the plan you should start with 
+            Goal: <the overall goal of the task -- restating it in your own words> 
+            Completion Criteria: <what did the user specify that would complete the task. Be complete and precise> 
+            Next, break the user's high-level request into a numbered sequence of 
+            concrete, executable steps (and sub-steps if necessary). Each step MUST include: 
+            (1) a clear instruction for the code_agent 
+            (2) any parameters or file names needed, and 
+            (3) explicit completion criteria. You are the expert in this area, 
+            so be very clear about the details and instructions so the code_agent doesn't 
+            have to fill in too many blanks. If code is requested, make sure to ask for it to
+            be run and tested also.
+                                         
+            Your plan should not be overly complex -- accomplish the task in the minimal 
+            number of steps necessary. Do NOT ask the agent to write scaffolding files first. 
+            Do NOT ask the agent not use a virtual environment or git repo or install anyything.
+            
+            Then you must delegate the to the `code_agent` and 
+            wait for its report. You should delegate enough steps that the code_agent can complete
+            then in a ~few function calls (eg write a few files and test them).
+            This agent does not know ANY context about the task, so
+            besure to provide complete instructions and background information.
+                                         
+            When a step is reported complete, mark it as 
+            done and delegate the next. The code_agent does not know of any 
+            previous work so be sure to give complete and verbose context. At each 
+            step you must give full context to the code_agent, including a summary of any
+            previous steps.
+                                         
+            Once you are confident all steps have been FULLY completed, pass the results
+            to the judge agent, fully explaining what the task was, the completion criteria, and
+            the solution. The judge agent will look at the results and report back if the
+            task is finished or not. Only after this has been complete, you can call final_answer
+            and report the results to the user.''')
 
         tools_manager = [
-            MakePlan(), FinalAnswer()
+            ListFiles(), MakePlan(),Reflect(), ReadFile(), RunPython(), FinalAnswer()
         ]
         if args.vision:
-            tools_all.insert(-1,ReadPDF())
-            tools_all.insert(-1,ViewImage())
+            tools_manager.insert(-1,ReadPDF())
+            tools_manager.insert(-1,ViewImage())
 
         if args.confirm_plan:
             tools_manager.append(GetUserInput())
 
+
+        # Create a judge agent
+        judge_prompt = ("You are the *judge_agent* - an impartial evaluator. Your role is to objectively assess work against "
+                    "specific success criteria. When evaluating, you should:\n"
+                    "1. Clearly state each success criterion\n"
+                    "2. Examine the relevant files/outputs to determine if criteria are met\n"
+                    "3. For each criterion, provide a clear PASS/FAIL assessment with evidence\n"
+                    "4. For any failures, explain why the criterion wasn't met\n"
+                    "Your evaluation should be thorough, evidence-based, and focus solely on whether the specified "
+                    "success criteria have been met, not on subjective qualities of the implementation.")
+
+
+        judge_agent = Agent(
+            tools=tools_manager,
+            model=model,  # Using the stronger model for evaluation
+            system_message=judge_prompt,
+            verbosity=args.verbosity,
+            max_steps=15,
+            name="judge_agent",
+            description="Evaluates work against success criteria and provides objective assessment.",
+            clear_memory_on_run=True,  # Starts with a clean memory for each evaluation
+        )
+
+
         agent = Agent(tools=tools_manager,
                         model=model,
                         system_message=manager_prompt,
-                        managed_agents=[agent_code],
+                        managed_agents=[agent_code,judge_agent],
                         max_steps=25,
                         verbosity=args.verbosity,
                         name="manager_agent",
