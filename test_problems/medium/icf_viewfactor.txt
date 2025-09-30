@@ -2,7 +2,7 @@ Estimate radiative flux on a 1 mm-radius spherical capsule centred in a cylindri
 
 Geometry  
 • Hohlraum: radius = 3 mm, length = 6 mm, axis = ẑ, equatorial plane at z = 0.  
-• Four laser hot-spots located on the inner wall at z = ±0.5 mm and z = ±1.5 mm (two rings).  
+• Four laser hot-spots located on the inner wall at z = ±0.5 mm and z = ±1.5 mm (two rings in each hemisphere).  
   Each spot has Gaussian intensity profile with FWHM = 0.25 mm (σ ≈ 0.106 mm).  
 • Treat each spot as a continuum of Lambertian point emitters at T = 300 eV (constant).  
 

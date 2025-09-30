@@ -373,8 +373,8 @@ class LLMClient:
 
     def __init__(
         self,
-        model_id: str = "gpt-4.1",
-        temperature: float = 0.7,
+        model_id: str = "gpt-5",
+        temperature: float = 0.2,
         api_key: str | None = None,
         api_base: str | None = None,
         debug: bool = False,
@@ -383,7 +383,7 @@ class LLMClient:
         self.model_id = model_id
         self.temperature = temperature
         self.debug = debug
-        if self.model_id.startswith('o'):
+        if self.model_id.startswith('o') or  self.model_id.startswith('gpt-5'):
             self.temperature = 1.0
 
     # ------------------------------------------------------------------
@@ -579,9 +579,9 @@ class Agent:
                 # plan_prompt = ("Draft a plan for {{ task }}" if local_step == 1 else "Plan update - {{ remaining_steps }} steps left.")
                 # self.memory.append(ChatMessage.user(self._populate(plan_prompt, task=task, remaining_steps=self.max_steps - local_step)))
                 # _ = self._take_action()
-                answer = self._take_action()
-            else:
                 answer = self._take_action(specific_tools=['make_plan'])
+            else:
+                answer = self._take_action()
             
             # Write memory trace to file if verbosity level is high enough
             if self.verbosity >= 3:
@@ -1046,33 +1046,6 @@ class Agent:
 ###############################################################################
 
 
-def _build_default_agent(debug: bool, local: bool, confirm_edits: bool = False, oai_model: str = 'gpt-4.1') -> Agent:  # noqa: D401
-    """Build a default agent with standard tools.
-    
-    Args:
-        debug: Enable verbose logging of API requests/responses
-        local: Use a local LLM server instead of OpenAI API
-        confirm_edits: Whether file edits and deletes require user confirmation
-    """
-    model = LLMClient(model_id="lmstudio" if local else oai_model, api_base="http://localhost:1234/v1" if local else None, debug=debug)
-    tools: list[Tool] = [
-        WriteFile(), 
-        ReadFile(), 
-        EditFile(confirm_edits=confirm_edits),  # Pass configuration to tools
-        Delete(confirm_edits=confirm_edits),    # Pass configuration to tools
-        RunPython(), 
-        RunBash(), 
-        ViewImage(),
-        ReadPDF(),     # Add PDF reading tool
-        ListFiles(), 
-        MakePlan(), 
-        Reflect(),     # Add reflection tool
-        GetUserInput(),
-        FinalAnswer()
-    ]
-    return Agent(tools=tools, model=model, max_steps=25, verbosity=3, name="code_agent", description="Writes/tests Python projects")
-
-
 def main() -> None:  # noqa: D401
     parser = argparse.ArgumentParser(description="Run the autonomous Agent")
     parser.add_argument("task", nargs="?", help="Initial user task (prompted if omitted)")
@@ -1086,6 +1059,8 @@ def main() -> None:  # noqa: D401
     parser.add_argument("--cp", default="", help="Copy file or directory to wkdir")
     parser.add_argument("-c", "--confirm-edits", action="store_true", 
                         help="Require confirmation before editing or deleting files")
+    parser.add_argument("-p", "--planning",default=0,type=int,
+                        help="Planning interval")
     parser.add_argument("--confirm-plan", action="store_true", 
                         help="Ask for confirmation after making initial plan")
     parser.add_argument( "--end", action="store_true", 
@@ -1159,6 +1134,7 @@ def main() -> None:  # noqa: D401
                     model=model,
                     max_steps=25,
                     verbosity=args.verbosity,
+                    planning_interval=args.planning,
                     name="code_agent",
                     description="Writes/tests Python projects")
     
@@ -1187,7 +1163,7 @@ def main() -> None:  # noqa: D401
             wait for its report. You should delegate enough steps that the code_agent can complete
             then in a ~few function calls (eg write a few files and test them).
             This agent does not know ANY context about the task, so
-            besure to provide complete instructions and background information.
+            be sure to provide complete instructions and background information.
                                          
             When a step is reported complete, mark it as 
             done and delegate the next. The code_agent does not know of any 
@@ -1241,17 +1217,12 @@ def main() -> None:  # noqa: D401
                         managed_agents=[agent_code,judge_agent],
                         max_steps=25,
                         verbosity=args.verbosity,
+                        planning_interval=args.planning,
                         name="manager_agent",
                         description="Magnages coding agents")
     
         if args.confirm_plan:
                 manager_prompt+="\n\nAfter creating the plan, ask the user for any further changes or approval."
-
-        # agent = _build_default_agent(debug=args.debug,
-        #                             local=args.local,
-        #                             confirm_edits=args.confirm_edits,
-        #                             oai_model=args.model)
-
         
     result = agent.run(user_task)
     print("\n=== FINAL ANSWER ===\n", result)
