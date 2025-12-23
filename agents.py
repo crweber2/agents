@@ -39,13 +39,18 @@ from __future__ import annotations
 # stdlib ---------------------------------------------------------------------
 import argparse
 import datetime as _dt
+import glob
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import sys
 import textwrap
+import threading
 import traceback
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, Iterable, List, Mapping, MutableMapping,
@@ -90,6 +95,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s ▸ %(messa
 
 # Global configuration flags
 CONFIRM_EDITS = False  # Set to True to enable interactive edit approval workflow
+NO_TOOL_CALL_MSG = (
+    "You must use a tool call. Which tool will let you proceed? Use final_answer if you are "
+    "FINISHED, otherwise use a different tool."
+)
 
 REMINDERS = textwrap.dedent(
     """\
@@ -106,6 +115,97 @@ REMINDERS = textwrap.dedent(
     function calls only, as this can impair your ability to solve the problem and think insightfully.
     """
 )
+
+
+class _EscListener:
+    """Listen for ESC key presses without blocking the main agent loop."""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._stdin_fd: int | None = None
+        self._orig_termios: list[int] | None = None
+
+    def start(self) -> bool:
+        """Start the listener thread if stdin is a TTY."""
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return True
+            if sys.stdin is None or not sys.stdin.isatty():
+                return False
+            self._stop.clear()
+            if os.name == "nt":
+                self._thread = threading.Thread(target=self._run_windows, daemon=True)
+                self._thread.start()
+                return True
+            try:
+                import termios
+                import tty
+
+                self._stdin_fd = sys.stdin.fileno()
+                self._orig_termios = termios.tcgetattr(self._stdin_fd)
+                tty.setcbreak(self._stdin_fd)
+            except Exception:
+                self._stdin_fd = None
+                self._orig_termios = None
+                return False
+            self._thread = threading.Thread(target=self._run_posix, daemon=True)
+            self._thread.start()
+            return True
+
+    def stop(self) -> None:
+        """Stop the listener thread and restore terminal state."""
+        with self._lock:
+            self._stop.set()
+            if self._thread:
+                self._thread.join(timeout=0.2)
+            if self._orig_termios is not None and self._stdin_fd is not None:
+                try:
+                    import termios
+
+                    termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, self._orig_termios)
+                except Exception:
+                    pass
+            self._thread = None
+            self._stdin_fd = None
+            self._orig_termios = None
+
+    def consume(self) -> bool:
+        """Return True once per ESC press."""
+        if self._event.is_set():
+            self._event.clear()
+            return True
+        return False
+
+    def _run_posix(self) -> None:
+        import select
+
+        while not self._stop.is_set():
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+            except Exception:
+                break
+            if not ready:
+                continue
+            ch = sys.stdin.read(1)
+            if not ch:
+                break
+            if ch == "\x1b":
+                self._event.set()
+
+    def _run_windows(self) -> None:
+        import msvcrt
+
+        while not self._stop.is_set():
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch == "\x1b":
+                    self._event.set()
+            else:
+                time.sleep(0.05)
+
 ###############################################################################
 # Chat message & memory classes
 ###############################################################################
@@ -133,6 +233,20 @@ def _normalise_tool_calls(raw):
                 },
             })
     return result
+
+
+def _coalesce_message_content(msg: Any) -> Any:  # noqa: D401
+    """Return message content, falling back to reasoning when content is empty."""
+    content = getattr(msg, "content", None)
+    if content in (None, ""):
+        reasoning = getattr(msg, "reasoning", None)
+        if reasoning:
+            try:
+                msg.content = reasoning
+            except Exception:
+                pass
+            return reasoning
+    return content
 
 @dataclass
 class ChatMessage:
@@ -354,11 +468,16 @@ class ConversationMemory(MutableSequence[ChatMessage]):
         )
         
         # Get summary from model
-        summary_msg = model.chat(
-            messages=[{"role": "system", "content": summary_prompt}],
-            tools=None
-        )
-        summary = summary_msg.content.strip()
+        try:
+            summary_msg = model.chat(
+                messages=[{"role": "system", "content": summary_prompt}],
+                tools=None
+            )
+            summary_content = _coalesce_message_content(summary_msg) or ""
+            summary = summary_content.strip()
+        except Exception as exc:  # pragma: no cover - runtime errors
+            LOGGER.warning("Conversation summarization failed: %s", exc)
+            return
         
         # Replace memory with head + summary + tail
         self._messages = head + [ChatMessage.assistant(summary)] + tail
@@ -411,7 +530,7 @@ _PAT_TOOL_CALLS_SPECIAL = re.compile(r"\[TOOL_CALLS\](\w+)<[^>]*>(\{.*?\})", re.
 _PAT_TOOL_CALLS_DIRECT = re.compile(r"\[TOOL_CALLS\](\w+)(\{.*?\})", re.DOTALL | re.IGNORECASE)
 _PAT_TOOL_CALLS_ARGS = re.compile(r"\[TOOL_CALLS\](\w+)\[ARGS\](\{.*)", re.DOTALL | re.IGNORECASE)
 _PAT_GPT_OSS = re.compile(r"<\|channel\|>commentary to=functions\.(\w+)\s*<\|constrain\|>json<\|message\|>(\{.*\})", re.DOTALL | re.IGNORECASE)
-_PATTERNS = [_PAT_BRACKETS, _PAT_XML, _PAT_FENCE, _PAT_FUNC, _PAT_BARE_JSON, _PAT_TOOL_CALLS_SPECIAL, _PAT_TOOL_CALLS_DIRECT, _PAT_TOOL_CALLS_ARGS, _PAT_GPT_OSS]
+_PATTERNS = []#_PAT_BRACKETS, _PAT_XML, _PAT_FENCE, _PAT_FUNC, _PAT_BARE_JSON, _PAT_TOOL_CALLS_SPECIAL, _PAT_TOOL_CALLS_DIRECT, _PAT_TOOL_CALLS_ARGS] #, _PAT_GPT_OSS]
 
 
 def _json_from_blob(blob: str) -> dict[str, Any]:  # noqa: D401
@@ -559,47 +678,83 @@ class Agent:
         # logging --------------------------------------------------------
         self._trace_dir = f"agent_traces_{_dt.datetime.now():%y%m%d_%H%M}"
         os.makedirs(self._trace_dir, exist_ok=True)
+        self._run_id: str | None = None
+        self._event_log_path: str | None = None
+        self._event_log_shared = False
+        self._current_local_step = 0
+        self._run_error: str | None = None
+        self._interrupt_listener: _EscListener | None = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def run(self, task: str, *, reset: bool = None) -> str:  # noqa: D401
+    def run(  # noqa: D401
+        self,
+        task: str | None,
+        *,
+        reset: bool = None,
+        start_step: int = 1,
+        append_user_task: bool = True,
+        resume_from: str | None = None,
+    ) -> str:
         """Run the agent until it produces a final answer."""
         # Use the attribute value if reset parameter is not provided
         should_reset = self.clear_memory_on_run if reset is None else reset
         if should_reset:
             self.memory = ConversationMemory()
             self.memory.append(ChatMessage.system(self.system_prompt))
-        self.memory.append(ChatMessage.user(task))
-        self._log("Task received", level=1)
+        self._run_error = None
+        if append_user_task:
+            if task is None:
+                raise ValueError("task is required unless append_user_task=False")
+            self.memory.append(ChatMessage.user(task))
+        task_for_log = task or ""
+        resume_step = start_step - 1 if start_step > 1 else None
+        self._start_run_log(task_for_log, reset=should_reset, resume_from=resume_from, resume_step=resume_step)
+        self._share_event_log()
+        self._log("Task received" if append_user_task else "Resuming run", level=1)
 
-        for local_step in range(1, self.max_steps + 1):
-            self._increment_master_step()
-            if self.planning_interval and (local_step == 1 or (local_step - 1) % self.planning_interval == 0):
-                # plan_prompt = ("Draft a plan for {{ task }}" if local_step == 1 else "Plan update - {{ remaining_steps }} steps left.")
-                # self.memory.append(ChatMessage.user(self._populate(plan_prompt, task=task, remaining_steps=self.max_steps - local_step)))
-                # _ = self._take_action()
-                answer = self._take_action(specific_tools=['make_plan'])
-            else:
-                answer = self._take_action()
-            
-            # Write memory trace to file if verbosity level is high enough
-            if self.verbosity >= 3:
-                self._dump_trace()
-            
-            # Auto-summarize memory if it exceeds threshold
-            if self.memory_threshold and len(self.memory) > self.memory_threshold:
-                self._log(f"Memory threshold reached ({len(self.memory)} > {self.memory_threshold}), summarizing...", 2)
-                self.memory.summarize(self.model)
-                self._log(f"Memory summarized to {len(self.memory)} messages", 2)
+        if start_step < 1:
+            start_step = 1
+        end_step = start_step + self.max_steps - 1
+        self._start_interrupt_listener()
+        try:
+            for local_step in range(start_step, end_step + 1):
+                self._current_local_step = local_step
+                self._increment_master_step()
+                if self.planning_interval and (local_step == 1 or (local_step - 1) % self.planning_interval == 0):
+                    # plan_prompt = ("Draft a plan for {{ task }}" if local_step == 1 else "Plan update - {{ remaining_steps }} steps left.")
+                    # self.memory.append(ChatMessage.user(self._populate(plan_prompt, task=task, remaining_steps=self.max_steps - local_step)))
+                    # _ = self._take_action()
+                    answer = self._take_action(specific_tools=['make_plan'])
+                else:
+                    answer = self._take_action()
                 
-            if answer is not None:
-                self._log("Final answer produced", 1)
-                return answer
-        # ------------- exhausted budget - force summary ------------------
-        self._log("Step budget exhausted - forcing summary", 1)
-        summary = self._summarize_for_final()
-        return summary
+                # Write memory trace to file if verbosity level is high enough
+                if self.verbosity >= 3:
+                    self._dump_trace()
+                
+                # Auto-summarize memory if it exceeds threshold
+                if self.memory_threshold and len(self.memory) > self.memory_threshold:
+                    self._log(f"Memory threshold reached ({len(self.memory)} > {self.memory_threshold}), summarizing...", 2)
+                    self.memory.summarize(self.model)
+                    self._log(f"Memory summarized to {len(self.memory)} messages", 2)
+
+                answer = self._handle_interrupt_after_step(answer)
+                    
+                if answer is not None:
+                    self._log("Final answer produced", 1)
+                    status = "error" if self._run_error else "completed"
+                    self._log_run_end(status=status, result=answer)
+                    return answer
+            # ------------- exhausted budget - force summary ------------------
+            self._log("Step budget exhausted - forcing summary", 1)
+            summary = self._summarize_for_final()
+            status = "error" if self._run_error else "exhausted"
+            self._log_run_end(status=status, result=summary)
+            return summary
+        finally:
+            self._stop_interrupt_listener()
 
     # Let an Agent instance behave like a tool ------------------------------
     def __call__(self, *, task: str, reset: bool = None) -> str:  # noqa: D401
@@ -612,9 +767,290 @@ class Agent:
     def _increment_master_step(cls) -> None:  # noqa: D401
         cls._global_step += 1
 
+    def _should_listen_for_interrupt(self) -> bool:  # noqa: D401
+        return (
+            threading.current_thread() is threading.main_thread()
+            and sys.stdin is not None
+            and sys.stdin.isatty()
+            and not self._event_log_shared
+        )
+
+    def _start_interrupt_listener(self) -> None:  # noqa: D401
+        if self._interrupt_listener is not None:
+            return
+        if not self._should_listen_for_interrupt():
+            return
+        listener = _EscListener()
+        if listener.start():
+            self._interrupt_listener = listener
+
+    def _stop_interrupt_listener(self) -> None:  # noqa: D401
+        if self._interrupt_listener is None:
+            return
+        self._interrupt_listener.stop()
+        self._interrupt_listener = None
+
+    def _prompt_for_interrupt(self) -> str | None:  # noqa: D401
+        listener = self._interrupt_listener
+        if listener:
+            listener.stop()
+        try:
+            prompt = "\n[esc] Enter a prompt to inject (or press Enter to continue): "
+            text = input(prompt).strip()
+        except EOFError:
+            return None
+        finally:
+            if listener:
+                listener.start()
+        return text or None
+
+    def _append_user_interrupt(self, content: str) -> None:  # noqa: D401
+        last_non_tool: ChatMessage | None = None
+        for msg in reversed(self.memory):
+            if msg.role != "tool":
+                last_non_tool = msg
+                break
+        if last_non_tool and last_non_tool.role == "user":
+            if isinstance(last_non_tool.content, list):
+                last_non_tool.content.append({"type": "text", "text": f"User interrupt: {content}"})
+            elif last_non_tool.content:
+                last_non_tool.content = f"{last_non_tool.content}\n\nUser interrupt: {content}"
+            else:
+                last_non_tool.content = f"User interrupt: {content}"
+            return
+        self.memory.append(ChatMessage.user(content))
+
+    def _handle_interrupt_after_step(self, answer: str | None) -> str | None:  # noqa: D401
+        if not self._interrupt_listener or not self._interrupt_listener.consume():
+            return answer
+        self._log("ESC detected - waiting for user input", 1)
+        user_prompt = self._prompt_for_interrupt()
+        if not user_prompt:
+            return answer
+        self._append_user_interrupt(user_prompt)
+        self._write_event({
+            "type": "user_message",
+            "step": self._step_info(),
+            "content": user_prompt,
+            "source": "esc_interrupt",
+        })
+        return None
+
     def _log(self, msg: str, level: int = 1) -> None:  # noqa: D401
         if self.verbosity >= level:
             LOGGER.info("#%04d %s - %s", self._global_step, self.name, msg)
+
+    # ------------------------------------------------------------------
+    def _start_run_log(
+        self,
+        task: str,
+        *,
+        reset: bool,
+        resume_from: str | None = None,
+        resume_step: int | None = None,
+    ) -> None:  # noqa: D401
+        if self._event_log_shared and self._event_log_path and self._run_id:
+            event: dict[str, Any] = {
+                "type": "agent_start",
+                "task": task,
+                "reset": reset,
+                "model": self.model.model_id,
+                "temperature": self.model.temperature,
+                "max_steps": self.max_steps,
+                "memory_len": len(self.memory),
+            }
+            self._write_event(event)
+            return
+        run_stamp = _dt.datetime.now().strftime("%y%m%d_%H%M%S")
+        self._run_id = f"{run_stamp}_{uuid.uuid4().hex[:8]}"
+        self._event_log_path = os.path.join(self._trace_dir, f"run_{self._run_id}.jsonl")
+        self._event_log_shared = False
+        event: dict[str, Any] = {
+            "type": "run_start",
+            "agent": self.name,
+            "task": task,
+            "reset": reset,
+            "model": self.model.model_id,
+            "temperature": self.model.temperature,
+            "max_steps": self.max_steps,
+            "memory_len": len(self.memory),
+        }
+        if resume_from:
+            event["resume_from"] = resume_from
+        if resume_step is not None:
+            event["resume_step"] = resume_step
+        self._write_event(event)
+
+    def _write_event(self, payload: Mapping[str, Any]) -> None:  # noqa: D401
+        if not self._event_log_path:
+            return
+        record = dict(payload)
+        record.setdefault("ts", time.time())
+        if self._run_id:
+            record.setdefault("run_id", self._run_id)
+        record.setdefault("agent", self.name)
+        with open(self._event_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=True) + "\n")
+
+    def _step_info(self) -> dict[str, int]:  # noqa: D401
+        return {"global": self._global_step, "local": self._current_local_step, "agent": self.name}
+
+    def _log_run_end(self, *, status: str, result: str) -> None:  # noqa: D401
+        event_type = "agent_end" if self._event_log_shared else "run_end"
+        payload: dict[str, Any] = {
+            "type": event_type,
+            "status": status,
+            "result": result,
+        }
+        if self._run_error:
+            payload["error"] = self._run_error
+        self._write_event(payload)
+
+    def _set_shared_event_log(self, path: str, run_id: str) -> None:  # noqa: D401
+        self._event_log_path = path
+        self._run_id = run_id
+        self._event_log_shared = True
+
+    def _share_event_log(self, visited: set[int] | None = None) -> None:  # noqa: D401
+        if not self._event_log_path or not self._run_id:
+            return
+        if visited is None:
+            visited = set()
+        if id(self) in visited:
+            return
+        visited.add(id(self))
+        for agent in self.managed_agents.values():
+            agent._set_shared_event_log(self._event_log_path, self._run_id)
+            agent._share_event_log(visited)
+
+    @staticmethod
+    def _tool_schema_hash(tool_schemas: Sequence[Mapping[str, Any]]) -> str:  # noqa: D401
+        normalized = sorted(
+            tool_schemas,
+            key=lambda t: t.get("function", {}).get("name", ""),
+        )
+        blob = json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _usage_to_dict(usage: Any) -> dict[str, Any]:  # noqa: D401
+        if usage is None:
+            return {}
+        if isinstance(usage, dict):
+            return usage
+        if hasattr(usage, "model_dump"):
+            return usage.model_dump()
+        if hasattr(usage, "to_dict"):
+            return usage.to_dict()
+        fields = ("prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens")
+        data = {k: getattr(usage, k) for k in fields if hasattr(usage, k)}
+        if data:
+            return data
+        try:
+            return {k: v for k, v in vars(usage).items() if not k.startswith("_")}
+        except TypeError:
+            return {}
+
+    @staticmethod
+    def _load_events_from_log(path: str) -> list[dict[str, Any]]:  # noqa: D401
+        events: list[dict[str, Any]] = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, 1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    events.append(json.loads(stripped))
+                except json.JSONDecodeError as exc:
+                    LOGGER.warning("Skipping bad JSONL line %d in %s: %s", line_no, path, exc)
+        return events
+
+    @staticmethod
+    def _find_latest_log(search_dir: str) -> str | None:  # noqa: D401
+        pattern = os.path.join(search_dir, "agent_traces_*", "run_*.jsonl")
+        candidates = glob.glob(pattern)
+        if not candidates:
+            return None
+        return max(candidates, key=os.path.getmtime)
+
+    def resume_from_log(self, path: str, *, step: int | None = None) -> dict[str, Any]:  # noqa: D401
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Log file not found: {path}")
+        if step is not None and step < 0:
+            raise ValueError("resume step must be >= 0")
+        events = self._load_events_from_log(path)
+        if not events:
+            raise ValueError(f"No events found in log: {path}")
+        events_for_agent = [
+            event for event in events
+            if event.get("agent") in (None, self.name)
+        ]
+
+        if step is not None:
+            filtered: list[dict[str, Any]] = []
+            for event in events_for_agent:
+                if event.get("type") in ("run_start", "agent_start"):
+                    filtered.append(event)
+                    continue
+                step_info = event.get("step")
+                if not step_info:
+                    continue
+                local = step_info.get("local")
+                if isinstance(local, int) and local <= step:
+                    filtered.append(event)
+            events_for_agent = filtered
+
+        run_start = next((e for e in events_for_agent if e.get("type") == "run_start"), None)
+        if run_start is None:
+            run_start = next((e for e in events_for_agent if e.get("type") == "agent_start"), None)
+        task = run_start.get("task") if run_start else ""
+
+        self.memory = ConversationMemory()
+        self.memory.append(ChatMessage.system(self.system_prompt))
+        if task:
+            self.memory.append(ChatMessage.user(task))
+
+        max_local = 0
+        max_global = 0
+        for event in events:
+            step_info = event.get("step")
+            if step_info:
+                global_step = step_info.get("global")
+                if isinstance(global_step, int) and global_step > max_global:
+                    max_global = global_step
+
+        for event in events_for_agent:
+            step_info = event.get("step")
+            if step_info:
+                local = step_info.get("local")
+                if isinstance(local, int) and local > max_local:
+                    max_local = local
+
+            etype = event.get("type")
+            if etype == "assistant_message":
+                self.memory.append(ChatMessage.assistant(
+                    event.get("content"),
+                    tool_calls=event.get("tool_calls"),
+                ))
+            elif etype == "tool_result":
+                self.memory.append(ChatMessage.tool(
+                    name=event.get("name") or "tool",
+                    tool_call_id=event.get("tool_call_id") or "call_0",
+                    result=str(event.get("result", "")),
+                ))
+            elif etype == "user_message":
+                self.memory.append(ChatMessage.user(event.get("content")))
+            elif etype == "step_end" and event.get("status") == "no_tool_call":
+                self.memory.append(ChatMessage.user(NO_TOOL_CALL_MSG))
+
+        self._current_local_step = max_local
+        Agent._global_step = max(Agent._global_step, max_global)
+
+        return {
+            "task": task,
+            "last_step": max_local,
+            "next_step": max_local + 1,
+        }
 
     # ------------------------------------------------------------------
     def _append_to_summary(self, tool_name: str, args: dict) -> None:  # noqa: D401
@@ -792,15 +1228,58 @@ class Agent:
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _tool_might_prompt(target: Tool) -> bool:  # noqa: D401
+        if isinstance(target, Agent):
+            return True
+        if isinstance(target, GetUserInput):
+            return True
+        if getattr(target, "uses_input", False):
+            return True
+        if getattr(target, "config", {}).get("confirm_edits", False):
+            return getattr(target, "name", "") in {"edit_file", "delete"}
+        return False
+
+    # ------------------------------------------------------------------
     def _take_action(self,specific_tools=None) -> str | None:  # noqa: D401 - returns final answer or None
         """Send current memory to LLM, execute any tool calls, append responses."""
         # ---- call the model -------------------------------------------
+        step_start = time.perf_counter()
         if specific_tools is None:
-            tools = [self._tool_to_openai(t) for t in self.tools.values()]
+            tool_objs = list(self.tools.values())
         else:
-            tools = [self._tool_to_openai(t) for t in self.tools.values() if t.name in specific_tools]
-        msg = self.model.chat(messages=self.memory.to_openai(), tools=tools)#[self._tool_to_openai(t) for t in self.tools.values()])
-        response_content = msg.content
+            tool_objs = [t for t in self.tools.values() if t.name in specific_tools]
+        tools = [self._tool_to_openai(t) for t in tool_objs]
+        tool_schema_hash = self._tool_schema_hash(tools)
+        self._write_event({
+            "type": "request",
+            "step": self._step_info(),
+            "model": self.model.model_id,
+            "temperature": self.model.temperature,
+            "tool_schema_hash": tool_schema_hash,
+            "tool_names": [t["function"]["name"] for t in tools],
+            "messages": len(self.memory),
+        })
+        try:
+            msg = self.model.chat(messages=self.memory.to_openai(), tools=tools)
+        except Exception as exc:  # pragma: no cover - runtime errors
+            err_msg = f"{type(exc).__name__}: {exc}"
+            self._run_error = err_msg
+            self._write_event({
+                "type": "model_error",
+                "step": self._step_info(),
+                "where": "take_action",
+                "error": err_msg,
+            })
+            self._write_event({
+                "type": "step_end",
+                "step": self._step_info(),
+                "status": "model_error",
+                "tokens": {},
+                "wall_time_sec": round(time.perf_counter() - step_start, 6),
+            })
+            return f"Model error: {err_msg}"
+        response_content = _coalesce_message_content(msg)
         # tool_calls = getattr(msg, "tool_calls", None)
         tool_calls = _normalise_tool_calls(getattr(msg, "tool_calls", None))
         
@@ -834,6 +1313,13 @@ class Agent:
         if hasattr(msg, 'usage'):
             assistant_msg.usage = msg.usage
         self.memory.append(assistant_msg)
+        self._write_event({
+            "type": "assistant_message",
+            "step": self._step_info(),
+            "content": response_content,
+            "tool_calls": tool_calls,
+        })
+        usage_info = self._usage_to_dict(getattr(msg, "usage", None))
         if self.verbosity >= 2 and _console is not None:
             _console.print(assistant_msg._pretty())
             if hasattr(msg, 'usage') and msg.usage:
@@ -842,8 +1328,14 @@ class Agent:
         # ---- dispatch tool calls --------------------------------------
         if not tool_calls:  # No tool was called - instruct agent to use a tool
             self._log("No tool call used, instructing the agent to try again", 1)
-            msg = "You must use a tool call. Which tool will let you proceed? Use final_answer if you are FINISHED, otherwise use a different tool."
-            self.memory.append(ChatMessage.user(msg))
+            self.memory.append(ChatMessage.user(NO_TOOL_CALL_MSG))
+            self._write_event({
+                "type": "step_end",
+                "step": self._step_info(),
+                "status": "no_tool_call",
+                "tokens": usage_info,
+                "wall_time_sec": round(time.perf_counter() - step_start, 6),
+            })
             return None
             
         # Dump trace before processing any tool calls to capture pre-execution state
@@ -859,15 +1351,54 @@ class Agent:
             target = self.tools.get(name)
             if target is None:
                 err = f"Unknown tool '{name}'"
+                self._write_event({
+                    "type": "tool_call",
+                    "step": self._step_info(),
+                    "name": name,
+                    "tool_call_id": tc.get("id", "call_0"),
+                    "arguments": args,
+                })
+                self._write_event({
+                    "type": "tool_result",
+                    "step": self._step_info(),
+                    "name": name,
+                    "tool_call_id": tc.get("id", "call_0"),
+                    "result": err,
+                    "error": True,
+                })
                 self.memory.append(ChatMessage.tool(name=name, tool_call_id=tc.get("id", "call_0"), result=err))
                 continue
                 
             # Log this tool call to the summary file
             self._append_to_summary(name, args)
+            self._write_event({
+                "type": "tool_call",
+                "step": self._step_info(),
+                "name": name,
+                "tool_call_id": tc.get("id", "call_0"),
+                "arguments": args,
+            })
+            if isinstance(target, Agent):
+                self._write_event({
+                    "type": "handoff_start",
+                    "step": self._step_info(),
+                    "to_agent": target.name,
+                    "task": args.get("task"),
+                })
+            listener = self._interrupt_listener
+            paused = False
+            if listener and self._tool_might_prompt(target):
+                listener.stop()
+                paused = True
             try:
                 result = target(**args)
+                tool_error: str | None = None
             except Exception as exc:  # pragma: no cover - runtime errors
                 result = f"ToolError[{name}]: {exc} ({traceback.format_exc().splitlines()[-1]})"
+                tool_error = str(exc)
+            finally:
+                if paused and listener:
+                    listener.start()
             
             content_for_log = str(result)
 
@@ -922,6 +1453,21 @@ class Agent:
                 img_count = len(pdf_images)
                 content_for_log = f"<PDF: {os.path.basename(filename)} • {page_info} • {text_count} text blocks, {img_count} images>"
 
+            self._write_event({
+                "type": "tool_result",
+                "step": self._step_info(),
+                "name": name,
+                "tool_call_id": tc.get("id", "call_0"),
+                "result": content_for_log,
+                "error": tool_error is not None,
+            })
+            if isinstance(target, Agent):
+                self._write_event({
+                    "type": "handoff_end",
+                    "step": self._step_info(),
+                    "to_agent": target.name,
+                    "error": tool_error is not None,
+                })
             self.memory.append(ChatMessage.tool(
                 name=name,
                 tool_call_id=tc.get("id", "call_0"),
@@ -935,7 +1481,19 @@ class Agent:
         # Feed images back to the model so it can "see" them
         if image_parts:
             self.memory.append(ChatMessage.user(image_parts))
+            self._write_event({
+                "type": "user_message",
+                "step": self._step_info(),
+                "content": image_parts,
+            })
 
+        self._write_event({
+            "type": "step_end",
+            "step": self._step_info(),
+            "status": "completed",
+            "tokens": usage_info,
+            "wall_time_sec": round(time.perf_counter() - step_start, 6),
+        })
         return final_answer
 
     # ------------------------------------------------------------------
@@ -943,11 +1501,38 @@ class Agent:
         """Force a summary via *final_answer* tool after step budget exhausted."""
         summary_prompt = "Summarise the current progress so the user can continue on their own."
         # Only *final_answer* tool is allowed
-        msg = self.model.chat(messages=self.memory.to_openai() + [ChatMessage.user(summary_prompt).to_openai()],
-                               tools=[self._tool_to_openai(self.tools["final_answer"])])
+        try:
+            msg = self.model.chat(
+                messages=self.memory.to_openai() + [ChatMessage.user(summary_prompt).to_openai()],
+                tools=[self._tool_to_openai(self.tools["final_answer"])],
+            )
+        except Exception as exc:  # pragma: no cover - runtime errors
+            err_msg = f"{type(exc).__name__}: {exc}"
+            self._write_event({
+                "type": "model_error",
+                "step": self._step_info(),
+                "where": "summarize_for_final_initial",
+                "error": err_msg,
+            })
+            fallback_messages = [ChatMessage.user(summary_prompt).to_openai()]
+            try:
+                msg = self.model.chat(
+                    messages=fallback_messages,
+                    tools=[self._tool_to_openai(self.tools["final_answer"])],
+                )
+            except Exception as fallback_exc:
+                err_msg = f"{type(fallback_exc).__name__}: {fallback_exc}"
+                self._run_error = err_msg
+                self._write_event({
+                    "type": "model_error",
+                    "step": self._step_info(),
+                    "where": "summarize_for_final",
+                    "error": err_msg,
+                })
+                return f"Model error during summary: {err_msg}"
         tool_calls = _normalise_tool_calls(getattr(msg, "tool_calls", None))
         if tool_calls is None:
-            return msg.content
+            return _coalesce_message_content(msg) or ""
         tc = tool_calls[0] #if getattr(msg, "tool_calls", None) else None
         if tc and tc["function"]["name"] == "final_answer":
             answer = json.loads(tc["function"].get("arguments", "{}")).get("answer", "")
@@ -1069,6 +1654,10 @@ def main() -> None:  # noqa: D401
                         help="Use multiple agents starting with a manager")
     parser.add_argument( "--vision", action="store_true", 
                         help="The model has vision and can use view_image tool")
+    parser.add_argument("--resume", nargs="?", const="auto",
+                        help="Resume from a JSONL log path (omit value to use latest).")
+    parser.add_argument("--resume-step", type=int,
+                        help="Resume after this local step (default: last step in log).")
 
     args = parser.parse_args()
 
@@ -1080,8 +1669,8 @@ def main() -> None:  # noqa: D401
     elif args.task:
         user_task = args.task
     else:
-        # Fall back to prompting if no task provided
-        user_task = input("Enter your task: ")
+        # Fall back to prompting if no task provided (unless resuming)
+        user_task = None if args.resume else input("Enter your task: ")
 
 
     if args.wkdir:
@@ -1224,7 +1813,35 @@ def main() -> None:  # noqa: D401
         if args.confirm_plan:
                 manager_prompt+="\n\nAfter creating the plan, ask the user for any further changes or approval."
         
-    result = agent.run(user_task)
+    resume_info = None
+    resume_path = None
+    if args.resume:
+        resume_path = args.resume
+        if resume_path == "auto":
+            resume_path = Agent._find_latest_log(os.getcwd())
+            if resume_path is None:
+                raise SystemExit("No JSONL logs found in agent_traces_*")
+        resume_info = agent.resume_from_log(resume_path, step=args.resume_step)
+
+    if resume_info:
+        if user_task is not None:
+            result = agent.run(
+                user_task,
+                reset=False,
+                start_step=resume_info["next_step"],
+                append_user_task=True,
+                resume_from=resume_path,
+            )
+        else:
+            result = agent.run(
+                resume_info["task"],
+                reset=False,
+                start_step=resume_info["next_step"],
+                append_user_task=False,
+                resume_from=resume_path,
+            )
+    else:
+        result = agent.run(user_task)
     print("\n=== FINAL ANSWER ===\n", result)
 
     # optional interactive loop -------------------------------------------

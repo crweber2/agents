@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Agent JSONL Log Viewer</title>
+    <style>
+      :root {
+        --bg: #f4f0e6;
+        --bg-accent: #e6ddcc;
+        --panel: #fbf8f1;
+        --ink: #2c2a25;
+        --muted: #6b6256;
+        --accent: #1f6f5b;
+        --accent-2: #b85d2a;
+        --line: #d5c9b8;
+        --code: #f1eadc;
+        --shadow: rgba(0, 0, 0, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        font-family: "Avenir Next", "Avenir", "Gill Sans", "Trebuchet MS", sans-serif;
+        background: radial-gradient(1200px 800px at 15% 10%, #fff7e9 0%, var(--bg) 45%, var(--bg-accent) 100%);
+      }
+
+      main {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 24px 18px 50px;
+      }
+
+      header {
+        display: flex;
+        gap: 16px;
+        align-items: baseline;
+        flex-wrap: wrap;
+        margin-bottom: 14px;
+      }
+
+      header h1 {
+        margin: 0;
+        font-size: 26px;
+        letter-spacing: 0.2px;
+      }
+
+      header p {
+        margin: 0;
+        color: var(--muted);
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 12px 14px;
+        box-shadow: 0 8px 30px var(--shadow);
+      }
+
+      .controls {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        align-items: center;
+        margin-bottom: 8px;
+      }
+
+      button,
+      .file-button {
+        border: 1px solid var(--line);
+        background: #fff;
+        color: var(--ink);
+        padding: 7px 12px;
+        border-radius: 8px;
+        cursor: pointer;
+        font: inherit;
+      }
+
+      button:hover,
+      .file-button:hover {
+        border-color: var(--accent);
+        color: var(--accent);
+      }
+
+      .file-button {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .file-input {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        border: 0;
+      }
+
+      .file-name {
+        font-size: 12px;
+        color: var(--muted);
+        min-width: 140px;
+      }
+
+      input[type="search"] {
+        padding: 6px 10px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fff;
+        min-width: 200px;
+      }
+
+      input[type="search"]:focus,
+      button:focus-visible,
+      .file-button:focus-visible {
+        outline: 2px solid rgba(31, 111, 91, 0.25);
+        outline-offset: 2px;
+      }
+
+      #drop-zone {
+        border: 2px dashed var(--line);
+        border-radius: 12px;
+        padding: 14px;
+        text-align: center;
+        color: var(--muted);
+        margin-bottom: 8px;
+        background: #fffdf8;
+        cursor: pointer;
+      }
+
+      #drop-zone.is-over {
+        border-color: var(--accent);
+        color: var(--accent);
+        background: #f7fff8;
+      }
+
+      #status {
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .meta-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+      }
+
+      .meta-pill {
+        display: inline-flex;
+        gap: 6px;
+        align-items: baseline;
+        padding: 6px 10px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: #fff;
+        font-size: 12px;
+        letter-spacing: 0.2px;
+      }
+
+      .meta-pill .label {
+        font-size: 10px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.7px;
+      }
+
+      .meta-pill .value {
+        font-weight: 600;
+      }
+
+      .task-line {
+        margin-top: 10px;
+        padding: 10px 12px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: #fff;
+      }
+
+      .task-line .label {
+        font-size: 11px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.7px;
+        margin-bottom: 6px;
+      }
+
+      .task-content {
+        white-space: pre-wrap;
+        font-family: "Iosevka", "JetBrains Mono", "Menlo", monospace;
+        font-size: 13px;
+        background: var(--code);
+        padding: 8px;
+        border-radius: 8px;
+      }
+
+      .meta-grid {
+        display: grid;
+        gap: 8px;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      }
+
+      .meta-item {
+        padding: 6px 8px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fff;
+      }
+
+      .meta-item .label {
+        font-size: 11px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.6px;
+        margin-bottom: 3px;
+      }
+
+      .meta-item .value {
+        font-size: 13px;
+        word-break: break-word;
+      }
+
+      .mono {
+        font-family: "Iosevka", "JetBrains Mono", "Menlo", monospace;
+        background: var(--code);
+        padding: 6px;
+        border-radius: 8px;
+        overflow: auto;
+        max-height: 240px;
+      }
+
+      .section-title {
+        margin: 18px 0 8px;
+        font-size: 15px;
+        color: var(--accent-2);
+        letter-spacing: 0.3px;
+      }
+
+      #steps {
+        margin-top: 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      details.step {
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--panel);
+        padding: 8px 12px;
+        box-shadow: 0 10px 26px var(--shadow);
+      }
+
+      details.step summary {
+        cursor: pointer;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 10px;
+        align-items: center;
+        list-style: none;
+      }
+
+      details.step summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .step-id {
+        font-weight: 700;
+      }
+
+      .chip {
+        padding: 2px 6px;
+        border-radius: 999px;
+        font-size: 11px;
+        background: #fff;
+        border: 1px solid var(--line);
+      }
+
+      .chip.completed {
+        color: var(--accent);
+        border-color: #b7dccb;
+        background: #f0fbf5;
+      }
+
+      .chip.no-tool {
+        color: #aa6a00;
+        border-color: #f0d6a8;
+        background: #fff7e6;
+      }
+
+      .chip.exhausted {
+        color: #a1362b;
+        border-color: #f0bdb6;
+        background: #fff0ee;
+      }
+
+      .tool-block {
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 8px;
+        background: #fff;
+        margin-bottom: 8px;
+      }
+
+      .tool-head {
+        font-weight: 600;
+        margin-bottom: 6px;
+      }
+
+      details.tool-block summary {
+        cursor: pointer;
+        list-style: none;
+      }
+
+      details.tool-block summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .tool-caption {
+        font-size: 11px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.6px;
+        margin: 8px 0 4px;
+      }
+
+      .hidden {
+        display: none;
+      }
+
+      .step-preview {
+        flex: 1 1 260px;
+        min-width: 180px;
+        color: var(--muted);
+        font-size: 12px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .chip.alert {
+        color: #a1362b;
+        border-color: #f0bdb6;
+        background: #fff0ee;
+      }
+
+      .fade-in {
+        animation: fadeIn 260ms ease-out;
+      }
+
+      @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(6px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .fade-in {
+          animation: none;
+        }
+      }
+
+      @media (max-width: 720px) {
+        header {
+          align-items: flex-start;
+        }
+        details.step summary {
+          flex-direction: column;
+          align-items: flex-start;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Agent JSONL Log Viewer</h1>
+        <p>Open a local .jsonl event log and explore steps, tools, and timings.</p>
+      </header>
+
+      <section class="panel">
+        <div class="controls">
+          <label id="file-button" class="file-button" for="file-input">Choose JSONL</label>
+          <input id="file-input" class="file-input" type="file" accept=".jsonl,application/jsonl,text/plain">
+          <span id="file-name" class="file-name">No file loaded</span>
+          <input id="filter-input" type="search" placeholder="Filter steps (tool, status, text)">
+          <button id="expand-all" type="button">Expand all</button>
+          <button id="collapse-all" type="button">Collapse all</button>
+          <button id="clear-view" type="button">Clear</button>
+        </div>
+        <div id="drop-zone">Drop a .jsonl file here or click to choose.</div>
+        <div id="status"></div>
+      </section>
+
+      <section id="run-meta" class="panel fade-in" aria-live="polite"></section>
+      <section id="parse-errors" class="panel hidden" aria-live="polite"></section>
+      <section id="steps" aria-live="polite"></section>
+    </main>
+
+    <script src="viewer.js"></script>
+  </body>
+</html>
