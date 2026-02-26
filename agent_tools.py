@@ -16,6 +16,7 @@ Key components:
 - ViewImage: Display images to the agent
 - ReadPDF: Read PDF files with full page images for complex content
 - MakePlan: Create step-by-step plans
+- UpdatePlan: Update step-by-step plans
 - FinalAnswer: Return final answers to the user
 - GetUserInput: Request information from the user
 
@@ -504,6 +505,88 @@ class RunBash(Tool):
         return truncate("".join(output))
 
 
+class Shell(Tool):
+    name = "shell"
+    description = """Run a shell command and return its combined stdout/stderr.
+
+    When to use:
+    - Execute system commands in a non-Windows environment.
+
+    Parameters:
+    - command             [array]  REQUIRED - command argv (e.g., ["bash", "-lc", "ls -la"]).
+    - workdir             [string] OPTIONAL - working directory for the command.
+    - timeout_ms          [number] OPTIONAL - timeout in milliseconds.
+    - sandbox_permissions [string] OPTIONAL - accepts "require_escalated" or "use_default".
+    - justification       [string] OPTIONAL - human-readable reason for escalation.
+
+    Usage example:
+    {
+      "tool": "shell",
+      "args": {
+        "command": ["bash", "-lc", "rg --files"],
+        "workdir": ".",
+        "timeout_ms": 5000
+      }
+    }
+
+    Special notes:
+    - This tool does not implement OS-level sandboxing.
+    - Output is truncated to 20 kB in the return value.
+    """
+    inputs = {
+        "command": {"type": "array", "description": "Command argv list."},
+        "workdir": {"type": "string", "description": "Working directory (optional)."},
+        "timeout_ms": {"type": "number", "description": "Timeout in milliseconds (optional)."},
+        "sandbox_permissions": {"type": "string", "description": "require_escalated or use_default."},
+        "justification": {"type": "string", "description": "Reason for escalation (optional)."},
+    }
+    output_type = "string"
+
+    def forward(
+        self,
+        *,
+        command: Union[str, list[str]],
+        workdir: Optional[str] = None,
+        timeout_ms: Optional[float] = None,
+        sandbox_permissions: str = "use_default",
+        justification: Optional[str] = None,
+    ) -> str:  # noqa: D401
+        _ = sandbox_permissions, justification
+        if isinstance(command, str):
+            import shlex
+
+            command = shlex.split(command)
+
+        if not isinstance(command, list) or not all(isinstance(c, str) for c in command):
+            return "Invalid command: expected list of strings."
+
+        cwd = workdir or "."
+        timeout_sec = None if timeout_ms is None else timeout_ms / 1000.0
+        try:
+            result = subprocess.run(
+                command,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout_sec,
+                check=False,
+            )
+        except FileNotFoundError:
+            return f"Command not found: {command[0]}"
+        except subprocess.TimeoutExpired as exc:
+            output = exc.output or ""
+            msg = f"[TIMEOUT] Command exceeded {timeout_ms} ms\n{output}"
+            return truncate(msg)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            return f"Error running command: {exc}"
+
+        output = result.stdout or ""
+        if result.returncode != 0:
+            output = f"[exit code {result.returncode}]\n{output}"
+        return truncate(output)
+
+
 class Delete(Tool):
     name = "delete"
     description = """Delete a file or directory (including all its contents).
@@ -928,6 +1011,81 @@ class ViewImage(Tool):
             data64 = base64.b64encode(fp.read()).decode()
         
         return f"data:{mime};base64,{data64}"
+
+
+class UpdatePlan(Tool):
+    name = "update_plan"
+    description = """Update the task plan.
+
+    When to use:
+    - Create or update a short step-by-step plan.
+    - Mark steps as pending, in_progress, or completed.
+
+    Parameters:
+    - plan [array] REQUIRED - list of plan items with "step" and "status".
+    - explanation [string] OPTIONAL - short reason or context for the update.
+
+    Usage example:
+    {
+      "tool": "update_plan",
+      "args": {
+        "explanation": "Refined steps after reviewing files",
+        "plan": [
+          {"step": "Inspect config", "status": "completed"},
+          {"step": "Adjust parser", "status": "in_progress"},
+          {"step": "Run tests", "status": "pending"}
+        ]
+      }
+    }
+
+    Special notes:
+    - At most one step should be in_progress.
+    """
+    inputs = {
+        "plan": {"type": "array", "description": "List of {step, status} items."},
+        "explanation": {"type": "string", "description": "Optional explanation for the update."},
+    }
+    output_type = "string"
+
+    def forward(self, *, plan: Any, explanation: Optional[str] = None) -> str:  # noqa: D401
+        if isinstance(plan, str):
+            try:
+                plan = json.loads(plan)
+            except json.JSONDecodeError:
+                return "Invalid plan: expected JSON array or list."
+
+        if not isinstance(plan, list):
+            return "Invalid plan: expected list."
+
+        allowed = {"pending", "in_progress", "completed"}
+        in_progress = 0
+        normalized: list[dict[str, str]] = []
+
+        for item in plan:
+            if isinstance(item, str):
+                step = item
+                status = "pending"
+            elif isinstance(item, dict):
+                step = item.get("step")
+                status = item.get("status", "pending")
+            else:
+                return "Invalid plan item: expected string or object."
+
+            if not isinstance(step, str) or not step.strip():
+                return "Invalid plan item: missing step."
+            if not isinstance(status, str) or status not in allowed:
+                return f"Invalid plan item status: {status!r}."
+
+            if status == "in_progress":
+                in_progress += 1
+
+            normalized.append({"step": step, "status": status})
+
+        if in_progress > 1:
+            return "Invalid plan: at most one step can be in_progress."
+
+        self._last_plan = {"explanation": explanation, "plan": normalized}
+        return "Plan updated"
 
 
 class MakePlan(Tool):
