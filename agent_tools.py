@@ -175,12 +175,14 @@ class ReadFile(Tool):
     - You must capture exact lines for a forthcoming edit_file call.
 
     Parameters:
-    - filename [string] REQUIRED - path to the file.
+    - filename   [string]  REQUIRED - path to the file.
+    - start_line [integer] OPTIONAL - 1-based first line to return (inclusive).
+    - end_line   [integer] OPTIONAL - 1-based last line to return (inclusive).
 
     Usage example:
     {
       "tool": "read_file",
-      "args": { "filename": "src/utils.py" }
+      "args": { "filename": "src/utils.py", "start_line": 20, "end_line": 60 }
     }
 
     Special notes:
@@ -188,16 +190,52 @@ class ReadFile(Tool):
     - If the user already pasted the file contents, reuse that copy
       instead of reading the file again.
     """
-    inputs = {"filename": {"type": "string", "description": "Path."}}
+    inputs = {
+        "filename": {"type": "string", "description": "Path."},
+        "start_line": {"type": "integer", "description": "Optional 1-based inclusive start line.", "required": False},
+        "end_line": {"type": "integer", "description": "Optional 1-based inclusive end line.", "required": False},
+    }
     output_type = "string"
 
-    def forward(self, *, filename: str) -> str:  # noqa: D401
+    def forward(
+        self,
+        *,
+        filename: str,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None,
+    ) -> str:  # noqa: D401
         if not os.path.isfile(filename):
             return f"File not found: {filename}"
+        if start_line is not None and start_line < 1:
+            return "Invalid start_line: must be >= 1."
+        if end_line is not None and end_line < 1:
+            return "Invalid end_line: must be >= 1."
+        if start_line is not None and end_line is not None and end_line < start_line:
+            return "Invalid line range: end_line must be >= start_line."
         try:
             with open(filename, "r", encoding="utf-8") as fp:
-                content = fp.read()
-                return truncate(content)
+                if start_line is None and end_line is None:
+                    content = fp.read()
+                    return truncate(content)
+
+                lines = fp.readlines()
+                total_lines = len(lines)
+                if total_lines == 0:
+                    return f"{filename} is empty."
+
+                start_idx = 0 if start_line is None else min(start_line - 1, total_lines)
+                end_idx = total_lines if end_line is None else min(end_line, total_lines)
+                if start_idx >= total_lines:
+                    return f"Requested start_line {start_line} is past EOF ({total_lines} lines)."
+
+                width = max(4, len(str(end_idx)))
+                selected = lines[start_idx:end_idx]
+                numbered = "".join(
+                    f"{i:>{width}}: {line}"
+                    for i, line in enumerate(selected, start=start_idx + 1)
+                )
+                header = f"{filename} lines {start_idx + 1}-{start_idx + len(selected)} of {total_lines}\n"
+                return truncate(header + numbered)
         except UnicodeDecodeError:
             return f"Cannot decode {filename} as UTF-8."
 
@@ -392,8 +430,8 @@ class RunPython(Tool):
     """
     inputs = {
         "filename": {"type": "string", "description": "Script path."},
-        "args": {"type": "string", "description": "Command-line arguments to pass to the script (optional)."},
-        "max_time": {"type": "number", "description": "Maximum execution time in seconds (optional)."}
+        "args": {"type": "string", "description": "Command-line arguments to pass to the script (optional).", "required": False},
+        "max_time": {"type": "number", "description": "Maximum execution time in seconds (optional).", "required": False}
     }
     output_type = "string"
 
@@ -513,11 +551,15 @@ class Shell(Tool):
     - Execute system commands in a non-Windows environment.
 
     Parameters:
-    - command             [array]  REQUIRED - command argv (e.g., ["bash", "-lc", "ls -la"]).
-    - workdir             [string] OPTIONAL - working directory for the command.
-    - timeout_ms          [number] OPTIONAL - timeout in milliseconds.
-    - sandbox_permissions [string] OPTIONAL - accepts "require_escalated" or "use_default".
-    - justification       [string] OPTIONAL - human-readable reason for escalation.
+    - command             [array|string] REQUIRED - command argv list, or a command string.
+    - workdir             [string]       OPTIONAL - working directory for the command.
+    - timeout_ms          [number]       OPTIONAL - timeout in milliseconds.
+    - stdin               [string]       OPTIONAL - text to send to stdin.
+    - env                 [object]       OPTIONAL - environment vars to add/override.
+    - shell_mode          [boolean]      OPTIONAL - if true, run string command via shell.
+    - max_output_chars    [integer]      OPTIONAL - truncate return value to this size (default 20000).
+    - sandbox_permissions [string]       OPTIONAL - accepts "require_escalated" or "use_default".
+    - justification       [string]       OPTIONAL - human-readable reason for escalation.
 
     Usage example:
     {
@@ -534,11 +576,15 @@ class Shell(Tool):
     - Output is truncated to 20 kB in the return value.
     """
     inputs = {
-        "command": {"type": "array", "description": "Command argv list."},
-        "workdir": {"type": "string", "description": "Working directory (optional)."},
-        "timeout_ms": {"type": "number", "description": "Timeout in milliseconds (optional)."},
-        "sandbox_permissions": {"type": "string", "description": "require_escalated or use_default."},
-        "justification": {"type": "string", "description": "Reason for escalation (optional)."},
+        "command": {"type": "any", "description": "Command argv list or command string."},
+        "workdir": {"type": "string", "description": "Working directory (optional).", "required": False},
+        "timeout_ms": {"type": "number", "description": "Timeout in milliseconds (optional).", "required": False},
+        "stdin": {"type": "string", "description": "Text to send to stdin (optional).", "required": False},
+        "env": {"type": "object", "description": "Environment variables to add/override (optional).", "required": False},
+        "shell_mode": {"type": "boolean", "description": "If true and command is a string, run via shell.", "required": False},
+        "max_output_chars": {"type": "integer", "description": "Max characters to return (optional).", "required": False},
+        "sandbox_permissions": {"type": "string", "description": "require_escalated or use_default.", "required": False},
+        "justification": {"type": "string", "description": "Reason for escalation (optional).", "required": False},
     }
     output_type = "string"
 
@@ -548,43 +594,90 @@ class Shell(Tool):
         command: Union[str, list[str]],
         workdir: Optional[str] = None,
         timeout_ms: Optional[float] = None,
+        stdin: Optional[str] = None,
+        env: Optional[dict[str, Any]] = None,
+        shell_mode: bool = False,
+        max_output_chars: Optional[int] = None,
         sandbox_permissions: str = "use_default",
         justification: Optional[str] = None,
     ) -> str:  # noqa: D401
-        _ = sandbox_permissions, justification
+        notes: list[str] = []
+        if sandbox_permissions not in {"use_default", "require_escalated"}:
+            return "Invalid sandbox_permissions: expected 'use_default' or 'require_escalated'."
+        if sandbox_permissions == "require_escalated":
+            notes.append("[note] sandbox_permissions=requested but this local Shell tool does not enforce sandbox escalation.")
+        if justification:
+            notes.append(f"[justification] {justification}")
+
+        run_kwargs: dict[str, Any] = {"shell": False}
+        command_display: str
         if isinstance(command, str):
-            import shlex
+            command_display = command
+            if shell_mode:
+                run_kwargs["shell"] = True
+            else:
+                import shlex
+                command = shlex.split(command)
+        elif isinstance(command, list) and all(isinstance(c, str) for c in command):
+            if shell_mode:
+                return "Invalid arguments: shell_mode=true requires command to be a string."
+            command_display = " ".join(command)
+        else:
+            return "Invalid command: expected string or list[str]."
 
-            command = shlex.split(command)
-
-        if not isinstance(command, list) or not all(isinstance(c, str) for c in command):
-            return "Invalid command: expected list of strings."
+        if env is not None:
+            if not isinstance(env, dict):
+                return "Invalid env: expected object mapping env var names to values."
+            bad_env = [k for k, v in env.items() if not isinstance(k, str) or not isinstance(v, (str, int, float, bool))]
+            if bad_env:
+                return "Invalid env: keys must be strings and values must be str/number/bool."
+            env_map = os.environ.copy()
+            env_map.update({k: str(v) for k, v in env.items()})
+        else:
+            env_map = None
 
         cwd = workdir or "."
         timeout_sec = None if timeout_ms is None else timeout_ms / 1000.0
+        max_chars = 20000 if max_output_chars is None else max(1, int(max_output_chars))
         try:
             result = subprocess.run(
                 command,
                 cwd=cwd,
+                env=env_map,
+                input=stdin,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 timeout=timeout_sec,
                 check=False,
+                **run_kwargs,
             )
         except FileNotFoundError:
-            return f"Command not found: {command[0]}"
+            if isinstance(command, list) and command:
+                return f"Command not found: {command[0]}"
+            return "Command not found."
         except subprocess.TimeoutExpired as exc:
             output = exc.output or ""
-            msg = f"[TIMEOUT] Command exceeded {timeout_ms} ms\n{output}"
-            return truncate(msg)
+            output_str = output.decode("utf-8", errors="replace") if isinstance(output, bytes) else str(output)
+            msg = f"[TIMEOUT] Command exceeded {timeout_ms} ms\n{output_str}"
+            if notes:
+                msg = "\n".join(notes) + "\n" + msg
+            return truncate(msg, max_length=max_chars)
         except Exception as exc:  # pragma: no cover - defensive guard
             return f"Error running command: {exc}"
 
         output = result.stdout or ""
+        header = [
+            f"[cwd] {os.path.abspath(cwd)}",
+            f"[command] {command_display}",
+            f"[exit code] {result.returncode}",
+        ]
         if result.returncode != 0:
-            output = f"[exit code {result.returncode}]\n{output}"
-        return truncate(output)
+            header.append("[status] command failed (non-zero exit)")
+        if notes:
+            header = notes + header
+        rendered = "\n".join(header) + "\n" + output
+        return truncate(rendered, max_length=max_chars)
 
 
 class Delete(Tool):
@@ -642,13 +735,15 @@ class Delete(Tool):
 
 class ListFiles(Tool):
     name = "list_files"
-    description = """Return a directory listing.
+    description = """Return a directory listing with lightweight metadata.
 
     When to use:
     - Discover what files/folders exist before reading or editing.
 
     Parameters:
-    - path [string] OPTIONAL - directory to list (defaults to current working directory).
+    - path           [string]  OPTIONAL - directory to list (defaults to current working directory).
+    - include_hidden [boolean] OPTIONAL - include dotfiles (default false).
+    - max_entries    [integer] OPTIONAL - cap the number of returned entries.
 
     Usage example:
     {
@@ -657,40 +752,184 @@ class ListFiles(Tool):
     }
 
     Output:
-    - Success → array of file/dir names.
+    - Success → array of strings with names plus metadata (type/size/line count).
     - Failure → string error message.
 
     Special notes:
     - Non‑recursive; call again on sub‑directories for deeper inspection.
     """
-    inputs = {"path": {"type": "string", "description": "Directory path."}}
+    inputs = {
+        "path": {"type": "string", "description": "Directory path.", "required": False},
+        "include_hidden": {"type": "boolean", "description": "Include dotfiles/directories (optional).", "required": False},
+        "max_entries": {"type": "integer", "description": "Maximum entries to return (optional).", "required": False},
+    }
     output_type = "array"
 
-    def forward(self, *, path: str = ".") -> list[str] | str:  # noqa: D401
+    def forward(
+        self,
+        *,
+        path: str = ".",
+        include_hidden: bool = False,
+        max_entries: Optional[int] = None,
+    ) -> list[str] | str:  # noqa: D401
         try:
             entries = os.listdir(path if path else ".")
             # Filter out hidden files (starting with '.') and agent_traces folders
-            entries = [entry for entry in entries 
-                    if not entry.startswith('.') 
+            entries = [entry for entry in entries
+                    if (include_hidden or not entry.startswith('.'))
                     and not entry.startswith('agent_traces')
                     and not entry.startswith('plan')
                     and not entry.startswith('reflection')]
+            if max_entries is not None and max_entries < 1:
+                return "Invalid max_entries: must be >= 1."
 
-            result = []
-            
-            # First add directories with trailing slash
-            dirs = sorted([f"{entry}/" for entry in entries 
-                          if os.path.isdir(os.path.join(path, entry))])
-            
-            # Then add files (without slash)
-            files = sorted([entry for entry in entries 
-                           if os.path.isfile(os.path.join(path, entry))])
-            
-            # Combine, with directories first
-            result = dirs + files
-            return result
+            # Directories first, then files
+            dirs = sorted([entry for entry in entries if os.path.isdir(os.path.join(path, entry))])
+            files = sorted([entry for entry in entries if os.path.isfile(os.path.join(path, entry))])
+            ordered = dirs + files
+            if max_entries is not None:
+                ordered = ordered[:max_entries]
+
+            def _fmt_size(num_bytes: int) -> str:
+                units = ["B", "KB", "MB", "GB"]
+                size = float(num_bytes)
+                for unit in units:
+                    if size < 1024 or unit == units[-1]:
+                        return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+                    size /= 1024
+                return f"{num_bytes} B"
+
+            result: list[str] = []
+            for entry in ordered:
+                full = os.path.join(path, entry)
+                if os.path.isdir(full):
+                    try:
+                        child_count = len(os.listdir(full))
+                        result.append(f"{entry}/ [dir, {child_count} item{'s' if child_count != 1 else ''}]")
+                    except Exception:
+                        result.append(f"{entry}/ [dir]")
+                    continue
+
+                try:
+                    size = os.path.getsize(full)
+                except OSError:
+                    size = -1
+
+                line_info = "unknown lines"
+                try:
+                    with open(full, "r", encoding="utf-8") as fp:
+                        line_count = sum(1 for _ in fp)
+                    line_info = f"{line_count} line{'s' if line_count != 1 else ''}"
+                except UnicodeDecodeError:
+                    line_info = "binary"
+                except Exception:
+                    line_info = "unreadable"
+
+                size_info = _fmt_size(size) if size >= 0 else "unknown size"
+                result.append(f"{entry} [{line_info}, {size_info}]")
+
+            hidden_note = "" if include_hidden else " (hidden excluded)"
+            prefix = f". [{len(result)} entries shown]{hidden_note}"
+            return [prefix] + result
         except FileNotFoundError:
             return f"Directory not found: {path}"
+        except NotADirectoryError:
+            return f"Not a directory: {path}"
+
+
+class SearchFiles(Tool):
+    name = "search_files"
+    description = """Search file contents using ripgrep (`rg`).
+
+    When to use:
+    - Find where a symbol, string, or pattern appears before reading/editing files.
+    - Quickly identify relevant files and line numbers.
+
+    Parameters:
+    - pattern        [string]  REQUIRED - regex pattern (or literal string if fixed_strings=true).
+    - path           [string]  OPTIONAL - directory/file path to search (defaults to current directory).
+    - glob           [string]  OPTIONAL - rg glob filter (e.g., "*.py").
+    - max_results    [integer] OPTIONAL - maximum matching lines to return.
+    - ignore_case    [boolean] OPTIONAL - case-insensitive search.
+    - fixed_strings  [boolean] OPTIONAL - treat pattern as a literal string.
+    - include_hidden [boolean] OPTIONAL - include hidden files/directories.
+
+    Usage example:
+    {
+      "tool": "search_files",
+      "args": { "pattern": "def main", "glob": "*.py", "max_results": 20 }
+    }
+
+    Special notes:
+    - Requires `rg` (ripgrep) to be installed.
+    - Returns line-numbered matches in `path:line:text` format.
+    """
+    inputs = {
+        "pattern": {"type": "string", "description": "Regex pattern or literal string to search for."},
+        "path": {"type": "string", "description": "Directory or file path to search (optional).", "required": False},
+        "glob": {"type": "string", "description": "Ripgrep glob filter (optional), e.g. *.py", "required": False},
+        "max_results": {"type": "integer", "description": "Maximum matching lines to return (optional).", "required": False},
+        "ignore_case": {"type": "boolean", "description": "Case-insensitive search (optional).", "required": False},
+        "fixed_strings": {"type": "boolean", "description": "Treat pattern literally (optional).", "required": False},
+        "include_hidden": {"type": "boolean", "description": "Include hidden files and directories (optional).", "required": False},
+    }
+    output_type = "string"
+
+    def forward(
+        self,
+        *,
+        pattern: str,
+        path: str = ".",
+        glob: Optional[str] = None,
+        max_results: Optional[int] = None,
+        ignore_case: bool = False,
+        fixed_strings: bool = False,
+        include_hidden: bool = False,
+    ) -> str:  # noqa: D401
+        if not isinstance(pattern, str) or not pattern:
+            return "Invalid pattern: expected non-empty string."
+        if max_results is not None and max_results < 1:
+            return "Invalid max_results: must be >= 1."
+
+        cmd = ["rg", "--line-number", "--no-heading", "--color", "never"]
+        if ignore_case:
+            cmd.append("-i")
+        if fixed_strings:
+            cmd.append("-F")
+        if include_hidden:
+            cmd.append("--hidden")
+        if glob:
+            cmd.extend(["-g", glob])
+        if max_results is not None:
+            cmd.extend(["-m", str(max_results)])
+
+        cmd.extend([pattern, path or "."])
+
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            return "Command not found: rg (install ripgrep to use search_files)."
+        except Exception as exc:  # pragma: no cover - defensive guard
+            return f"Error running rg: {exc}"
+
+        output = result.stdout or ""
+        if result.returncode == 0:
+            header = f"[rg] {pattern!r} in {path or '.'}"
+            if glob:
+                header += f" (glob={glob})"
+            return truncate(header + "\n" + output)
+        if result.returncode == 1:
+            header = f"[rg] no matches for {pattern!r} in {path or '.'}"
+            if glob:
+                header += f" (glob={glob})"
+            return header
+        return truncate(f"[rg exit code {result.returncode}]\n{output}")
 
 
 class ReadPDF_txtimg(Tool):
@@ -724,8 +963,8 @@ class ReadPDF_txtimg(Tool):
     """
     inputs = {
         "filename": {"type": "string", "description": "Path to the PDF file"},
-        "page": {"type": "integer", "description": "Specific page to extract (1-based indexing, optional)"},
-        "image_only": {"type": "boolean", "description": "If true, only returns page images without text"}
+        "page": {"type": "integer", "description": "Specific page to extract (1-based indexing, optional)", "required": False},
+        "image_only": {"type": "boolean", "description": "If true, only returns page images without text", "required": False}
     }
     output_type = "object"
 
@@ -1043,7 +1282,7 @@ class UpdatePlan(Tool):
     """
     inputs = {
         "plan": {"type": "array", "description": "List of {step, status} items."},
-        "explanation": {"type": "string", "description": "Optional explanation for the update."},
+        "explanation": {"type": "string", "description": "Optional explanation for the update.", "required": False},
     }
     output_type = "string"
 

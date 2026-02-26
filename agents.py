@@ -53,8 +53,9 @@ from typing import (Any, Callable, Dict, Iterable, List, Mapping, MutableMapping
 
 # local ----------------------------------------------------------------------
 from agent_tools import (
-    Tool, WriteFile, ReadFile, EditFile, Delete, RunPython,
-    RunBash, ViewImage, ListFiles, MakePlan, Reflect, FinalAnswer, GetUserInput,
+    Tool, WriteFile, ReadFile, EditFile, EditFile_patch, Delete, RunPython,
+    RunBash, Shell, ViewImage, ListFiles, SearchFiles, MakePlan, Reflect, FinalAnswer, GetUserInput,
+    UpdatePlan, SearchFiles, Shell,
     ReadPDF, truncate, authorized_types, _RE_TRAILING_COMMA
 )
 
@@ -373,7 +374,7 @@ class LLMClient:
 
     def __init__(
         self,
-        model_id: str = "gpt-5",
+        model_id: str = "gpt-5.3-codex",
         temperature: float = 0.2,
         api_key: str | None = None,
         api_base: str | None = None,
@@ -503,21 +504,17 @@ class Agent:
             - Break down the task into into small, incremental steps.
             - For each tasks, identify completion critera
 
-            ## 3. Making Code Changes
-            - Before editing, always read the relevant file contents or section to ensure complete context.
-            - If a patch is not applied correctly, attempt to reapply it.
-            - Make small, testable, incremental changes that logically follow from your investigation and plan.
-
-            ## 4. Debugging
+            ## 3. Debugging
             - Make code changes only if you have high confidence they can solve the problem
             - When debugging, try to determine the root cause rather than addressing symptoms
             - Debug for as long as needed to identify the root cause and identify a fix
             - Use print statements, logs, or temporary code to inspect program state, including descriptive statements or error messages to understand what's happening
+            - Operate in a headless mode in python, so do not use "show()" in matplotlib
             - To test hypotheses, you can also add test statements or functions
             - Do no make new versions of files (eg *_v2.py, *_v2_final.py) unless necessary. Just edit the files.
             - Revisit your assumptions if unexpected behavior occurs.
 
-            ## 7. Final Verification
+            ## 4. Final Verification
             - Confirm that all completion criteria are completed
             - If applicable, view any image that are produced to make sure they look as expected
             - Iterate until you are extremely confident the solution is complete and correct.
@@ -579,7 +576,7 @@ class Agent:
                 # plan_prompt = ("Draft a plan for {{ task }}" if local_step == 1 else "Plan update - {{ remaining_steps }} steps left.")
                 # self.memory.append(ChatMessage.user(self._populate(plan_prompt, task=task, remaining_steps=self.max_steps - local_step)))
                 # _ = self._take_action()
-                answer = self._take_action(specific_tools=['make_plan'])
+                answer = self._take_action(specific_tools=['update_plan'])
             else:
                 answer = self._take_action()
             
@@ -788,7 +785,7 @@ class Agent:
                     description += " This team member starts with a clean memory for each task and needs comprehensive context."
                 lines.append(f"- {agent.name}: {description}")
         
-        lines.append("\nCall tools by returning a message that contains *only* a valid tool-call JSON object.")
+        # lines.append("\nCall tools by returning a message that contains *only* a valid tool-call JSON object.")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -958,16 +955,37 @@ class Agent:
     # ------------------------------------------------------------------
     @staticmethod
     def _tool_to_openai(tool: Tool) -> dict[str, Any]:  # noqa: D401
+        properties: dict[str, Any] = {}
+        required: list[str] = []
+        for k, v in tool.inputs.items():
+            prop = {pk: pv for pk, pv in v.items() if pk != "required"}
+            if prop.get("type") == "any":
+                # OpenAI tool schemas do not accept a literal JSON Schema type "any".
+                # Omitting the type leaves the property unconstrained.
+                prop.pop("type", None)
+            elif prop.get("type") == "array" and "items" not in prop:
+                # OpenAI requires array schemas to specify an items schema.
+                prop["items"] = {}
+            elif prop.get("type") == "object" and "properties" not in prop and "additionalProperties" not in prop:
+                # Allow free-form objects for tools like shell.env.
+                prop["additionalProperties"] = True
+            properties[k] = prop
+            if v.get("required", True):
+                required.append(k)
+
+        parameters: dict[str, Any] = {
+            "type": "object",
+            "properties": properties,
+        }
+        if required:
+            parameters["required"] = required
+
         return {
             "type": "function",
             "function": {
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": {
-                    "type": "object",
-                    "properties": {k: {"type": v["type"], "description": v["description"]} for k, v in tool.inputs.items()},
-                    "required": list(tool.inputs.keys()),
-                },
+                "parameters": parameters,
             },
         }
 
@@ -1113,11 +1131,16 @@ def main() -> None:  # noqa: D401
         
         os.chdir(workdir)
 
+    # tools_all = [
+    #     WriteFile(), ReadFile(), SearchFiles(), EditFile_patch(), EditFile(confirm_edits=args.confirm_edits), RunPython(),
+    #     RunBash(), Shell(), Delete(confirm_edits=args.confirm_edits),
+    #     MakePlan(), Reflect(), ListFiles(), FinalAnswer()
+    # ]
     tools_all = [
-        WriteFile(), ReadFile(), EditFile(confirm_edits=args.confirm_edits), RunPython(),
-        RunBash(), Delete(confirm_edits=args.confirm_edits),
-        MakePlan(), Reflect(), ListFiles(), FinalAnswer()
+        WriteFile(), ReadFile(), SearchFiles(), EditFile(confirm_edits=args.confirm_edits), #EditFile_patch(),# , RunPython(),
+        Shell(), UpdatePlan(), ListFiles(), FinalAnswer()
     ]
+
     if not args.multi:
         tools_all.insert(-1,ReadPDF())
     if args.vision:
@@ -1143,7 +1166,7 @@ def main() -> None:  # noqa: D401
         agent_code.clear_memory_on_run = True
 
         manager_prompt = textwrap.dedent('''You are the *manager_agent* - a senior engineer. Your first 
-            task is to use the make_plan tool. In the plan you should start with 
+            task is to use the update_plan tool. In the plan you should start with 
             Goal: <the overall goal of the task -- restating it in your own words> 
             Completion Criteria: <what did the user specify that would complete the task. Be complete and precise> 
             Next, break the user's high-level request into a numbered sequence of 
@@ -1178,7 +1201,7 @@ def main() -> None:  # noqa: D401
             and report the results to the user.''')
 
         tools_manager = [
-            ListFiles(), MakePlan(),Reflect(), ReadFile(), RunPython(), FinalAnswer()
+            ListFiles(), SearchFiles(), MakePlan(),Reflect(), ReadFile(), RunPython(), Shell(), FinalAnswer()
         ]
         if args.vision:
             tools_manager.insert(-1,ReadPDF())
