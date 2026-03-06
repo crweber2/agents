@@ -60,27 +60,14 @@ from agent_tools import (
 )
 
 # 3rd-party ------------------------------------------------------------------
-try:
-    from rich.console import Console, Group
-    from rich.panel import Panel
-    from rich.syntax import Syntax
-    from rich.text import Text
+from rich.console import Console, Group
+from rich.panel import Panel
+from rich.syntax import Syntax
+from rich.text import Text
 
-    _console: Console | None = Console()
-except ImportError:  # pragma: no cover - Rich not installed
+_console: Console | None = Console()
 
-    class _DummyConsole:  # noqa: D401
-        """Fallback console that prints plain text."""
-
-        def print(self, *args: Any, **_: Any) -> None:  # noqa: D401
-            print(*args)
-
-    _console = _DummyConsole()
-
-try:
-    from openai import OpenAI  # type: ignore
-except ImportError as exc:  # pragma: no cover - optional dependency
-    raise SystemExit("`openai` package missing - install it to run the agent") from exc
+from openai import OpenAI
 
 ###############################################################################
 # Helpers & constants
@@ -181,6 +168,36 @@ class ChatMessage:
             if self.tool_calls is not None:
                 msg["tool_calls"] = self.tool_calls
         return msg
+
+    # ------------------------------------------------------------------
+    # Session serialisation helpers
+    # ------------------------------------------------------------------
+    def to_session(self) -> Dict[str, Any]:
+        return {
+            "role": self.role,
+            "content": self.content,
+            "name": self.name,
+            "tool_call_id": self.tool_call_id,
+            "tool_calls": _normalise_tool_calls(self.tool_calls),
+        }
+
+    @classmethod
+    def from_session(cls, data: Dict[str, Any]) -> "ChatMessage":
+        role = data.get("role")
+        content = data.get("content")
+        if role == "assistant":
+            return cls.assistant(content, tool_calls=data.get("tool_calls"))
+        if role == "tool":
+            return cls.tool(
+                name=data.get("name", ""),
+                tool_call_id=data.get("tool_call_id", ""),
+                result=content or ""
+            )
+        if role == "system":
+            return cls.system(content or "")
+        if role == "user":
+            return cls("user", content)
+        return cls(role or "user", content)
 
     # ------------------------------------------------------------------
     # Rich pretty-print helpers - optional
@@ -306,7 +323,7 @@ class ConversationMemory(MutableSequence[ChatMessage]):
         return [m.to_openai() for m in self._messages]
         
     # Memory summarization -------------------------------------------------
-    def summarize(self, model: Any) -> None:
+    def summarize(self, model: Any, tail_len = 0) -> None:
         """
         Summarize the middle of the conversation when it grows too large.
         
@@ -322,19 +339,20 @@ class ConversationMemory(MutableSequence[ChatMessage]):
             
         # Keep head (system + first user + optional plan)
         head = list(self._messages[:2])
-        if len(self._messages) > 2 and self._messages[2].role == "assistant":
-            head.append(self._messages[2])  # keep initial plan
+        # if len(self._messages) > 2 and self._messages[2].role == "assistant":
+        #     head.append(self._messages[2])  # keep initial plan
             
-        # Keep tail (last 4 messages)
-        tail_len = 4
-        tail = list(self._messages[-tail_len:])
-        
-        # Skip leading tool responses in tail
-        while tail and tail[0].role == "tool":
-            tail.pop(0)
-            if len(tail) < 2 and len(self._messages) > len(head) + 2:
-                # Grab more from the original to ensure we have at least a couple messages
-                tail.insert(0, self._messages[-(tail_len + 1)])
+        # Keep tail (default: last 4 messages)
+        tail = []
+        if tail_len>0:
+            tail = list(self._messages[-tail_len:])
+            
+            # Skip leading tool responses in tail
+            while tail and tail[0].role == "tool":
+                tail.pop(0)
+                if len(tail) < 2 and len(self._messages) > len(head) + 2:
+                    # Grab more from the original to ensure we have at least a couple messages
+                    tail.insert(0, self._messages[-(tail_len + 1)])
                 
         # Build body text to summarize
         body_msgs = self._messages[len(head):-len(tail)] if tail else self._messages[len(head):]
@@ -349,9 +367,11 @@ class ConversationMemory(MutableSequence[ChatMessage]):
         
         # Ask model for summary
         summary_prompt = (
-            "Summarize the following conversation so another agent could "
-            "continue where we left off. Preserve any filenames, decisions, "
-            "plans or variable names that matter.\n\n" + combined
+            "Summarize the following conversation so another agent can "
+            "continue where we left off. Be absolutely complete in your summary, ensuring nothing is "
+            "forgotten. Preserve any filenames, decisions, plans or variable names that matter. "
+            "Included every everything you tried, even if it failed. Make sure to summarize all files that you wrote "
+            "or existing directories that you are using. \n\n" + combined
         )
         
         # Get summary from model
@@ -391,8 +411,16 @@ class LLMClient:
     def chat(self, *, messages: list[Mapping[str, Any]], tools: list[Mapping[str, Any]] | None = None) -> Any:  # noqa: D401
         if self.debug:
             LOGGER.info("Sending request → %s", self.model_id)
-        resp = self.client.chat.completions.create(model=self.model_id, messages=messages, tools=tools or None,
-                                                   tool_choice="auto" if tools else None, temperature=self.temperature)
+        kwargs: dict[str, Any] = {
+            "model": self.model_id,
+            "messages": messages,
+            "temperature": self.temperature,
+        }
+        if tools: # only include tool-related params when we actually have tools.
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+
+        resp = self.client.chat.completions.create(**kwargs)
         # Attach usage information to the message object so it's available for token counting display
         message = resp.choices[0].message
         if hasattr(resp, 'usage'):
@@ -454,6 +482,7 @@ class Agent:
         description: str = "Coding agents that completes tasks using tools.",
         max_steps: int = 20,
         verbosity: int = 1,
+        auto_save: bool = True,
         planning_interval: int | None = None,
         memory_threshold: int | None = None,
         managed_agents: Sequence["Agent"] | None = None,
@@ -542,6 +571,7 @@ class Agent:
         self.memory_threshold = memory_threshold
         self.clear_memory_on_run = clear_memory_on_run
         self.include_function_thoughts = include_function_thoughts
+        self.auto_save = auto_save
         
         # Add inputs/output_type for use as a tool (when this agent is called by another agent)
         self.inputs = {
@@ -555,7 +585,7 @@ class Agent:
         self.tools.update(self.managed_agents)  # treat them like tools
         # logging --------------------------------------------------------
         self._trace_dir = f"agent_traces_{_dt.datetime.now():%y%m%d_%H%M}"
-        os.makedirs(self._trace_dir, exist_ok=True)
+        #os.makedirs(self._trace_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
     # Public API
@@ -985,7 +1015,11 @@ class Agent:
             "function": {
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": parameters,
+                "parameters": {
+                    "type": "object",
+                    "properties": {k: {"type": v["type"], "description": v["description"]} for k, v in tool.inputs.items()},
+                    "required": list(tool.inputs.keys()),
+                },
             },
         }
 
@@ -1059,10 +1093,99 @@ class Agent:
             out = out.replace(f"{{{{ {k} }}}}", str(v)).replace(f"{{{{{k}}}}}", str(v))
         return out
 
+    # ------------------------------------------------------------------
+    # Session snapshot helpers
+    # ------------------------------------------------------------------
+    def snapshot(self) -> dict:  # noqa: D401
+        return {
+            "version": 1,
+            "timestamp": f"{_dt.datetime.now():%Y-%m-%dT%H:%M:%S}",
+            "agent": {
+                "name": self.name,
+                "description": self.description,
+                "max_steps": self.max_steps,
+                "verbosity": self.verbosity,
+                "planning_interval": self.planning_interval,
+                "memory_threshold": self.memory_threshold,
+                "include_function_thoughts": self.include_function_thoughts,
+            },
+            "model": {
+                "model_id": getattr(self.model, "model_id", None),
+                "temperature": getattr(self.model, "temperature", None),
+                "debug": getattr(self.model, "debug", None),
+            },
+            "memory": [m.to_session() for m in self.memory],
+            "global_step": self._global_step,
+            "cwd": os.getcwd(),
+            "trace_dir": getattr(self, "_trace_dir", None),
+        }
+
+    def save_session(self, path = None) -> None:  # noqa: D401
+        if path:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        else:
+            session_dir = os.path.join(os.getcwd(), ".agent_sessions")
+            os.makedirs(session_dir, exist_ok=True)
+            path = os.path.join(session_dir, f"{self.name}_{_dt.datetime.now():%y%m%d_%H%M%S}.json")
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.snapshot(), f, indent=2)
+        print(f"Session saved to {path}")
+        print(f"Resume with:\n  --resume \"{path}\"")
+
+    @staticmethod
+    def load_session(path: str) -> dict:  # noqa: D401
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    @classmethod
+    def from_session(cls, session: dict, *, model: "LLMClient", tools: Sequence["Tool"]) -> "Agent":  # noqa: D401
+        ag = session.get("agent", {})
+        inst = cls(
+            tools=tools,
+            model=model,
+            name=ag.get("name", "agent"),
+            description=ag.get("description", ""),
+            max_steps=ag.get("max_steps", 20),
+            verbosity=ag.get("verbosity", 1),
+            planning_interval=ag.get("planning_interval"),
+            memory_threshold=ag.get("memory_threshold"),
+            include_function_thoughts=ag.get("include_function_thoughts", True),
+        )
+        # rebuild memory
+        inst.memory = ConversationMemory()
+        for msg in session.get("memory", []):
+            inst.memory.append(ChatMessage.from_session(msg))
+        # restore master counter and trace directory
+        try:
+            cls._global_step = int(session.get("global_step", 0))
+        except Exception:
+            pass
+        td = session.get("trace_dir")
+        if td:
+            inst._trace_dir = td
+        return inst
+
 ###############################################################################
 # CLI convenience entry-point
 ###############################################################################
 
+
+def _find_latest_session(session_dir: str) -> Optional[str]:  # noqa: D401
+    try:
+        if not os.path.isdir(session_dir):
+            return None
+        files = [
+            os.path.join(session_dir, f)
+            for f in os.listdir(session_dir)
+            if f.endswith(".json") and os.path.isfile(os.path.join(session_dir, f))
+        ]
+        if not files:
+            return None
+        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return files[0]
+    except Exception:
+        return None
 
 def main() -> None:  # noqa: D401
     parser = argparse.ArgumentParser(description="Run the autonomous Agent")
@@ -1087,19 +1210,44 @@ def main() -> None:  # noqa: D401
                         help="Use multiple agents starting with a manager")
     parser.add_argument( "--vision", action="store_true", 
                         help="The model has vision and can use view_image tool")
+    parser.add_argument("--resume", nargs="?", const="LATEST", help="Resume from a session JSON (omit value to resume latest)")
+    parser.add_argument("--session-dir", default=None, help="Directory to save sessions on 'end' (default ./.ants_sessions)")
+    parser.add_argument("--chdir-on-resume", action="store_true", help="chdir to session cwd on resume")
 
     args = parser.parse_args()
 
 
 
-    # If task ends with .txt, assume it's a file path and read from it
-    if args.task and args.task.endswith(".txt"):
-        user_task = open(args.task).read()
-    elif args.task:
-        user_task = args.task
+    # Resolve resume path if requested
+    resume_path: Optional[str] = None
+    if args.resume:
+        if args.resume == "LATEST":
+            session_dir = args.session_dir or os.path.join(os.getcwd(), ".ants_sessions")
+            resume_path = _find_latest_session(session_dir)
+            if resume_path:
+                print(f"Resuming latest session: {resume_path}")
+            else:
+                print(f"No session found in {session_dir}; starting fresh.")
+        else:
+            resume_path = args.resume
+
+    # Determine user task, avoid prompting when resuming without a task
+    if resume_path:
+        if args.task and args.task.endswith(".txt"):
+            user_task = open(args.task).read()
+        elif args.task:
+            user_task = args.task
+        else:
+            user_task = None
     else:
-        # Fall back to prompting if no task provided
-        user_task = input("Enter your task: ")
+        # If task ends with .txt, assume it's a file path and read from it
+        if args.task and args.task.endswith(".txt"):
+            user_task = open(args.task).read()
+        elif args.task:
+            user_task = args.task
+        else:
+            # Fall back to prompting if no task provided
+            user_task = input("Enter your task: ")
 
 
     if args.wkdir:
@@ -1153,13 +1301,19 @@ def main() -> None:  # noqa: D401
         api_base="http://localhost:1234/v1" if args.local else None,
     )
 
-    agent = Agent(tools=tools_all,
-                    model=model,
-                    max_steps=25,
-                    verbosity=args.verbosity,
-                    planning_interval=args.planning,
-                    name="code_agent",
-                    description="Writes/tests Python projects")
+    if resume_path:
+        session = Agent.load_session(resume_path)
+        if args.chdir_on_resume and "cwd" in session and os.path.isdir(session["cwd"]):
+            os.chdir(session["cwd"])
+        agent = Agent.from_session(session, model=model, tools=tools_all)
+    else:
+        agent = Agent(tools=tools_all,
+                        model=model,
+                        max_steps=25,
+                        verbosity=args.verbosity,
+                        planning_interval=args.planning,
+                        name="code_agent",
+                        description="Writes/tests Python projects")
     
     if args.multi:
         agent_code = agent
@@ -1247,16 +1401,36 @@ def main() -> None:  # noqa: D401
         if args.confirm_plan:
                 manager_prompt+="\n\nAfter creating the plan, ask the user for any further changes or approval."
         
-    result = agent.run(user_task)
-    print("\n=== FINAL ANSWER ===\n", result)
+    if user_task:
+        result = agent.run(user_task, reset=False if resume_path else None)
+        print("\n=== FINAL ANSWER ===\n", result)
+        agent.save_session()
 
     # optional interactive loop -------------------------------------------
     while True and not args.end:
-        follow = input("Feedback (or 'end'): ").strip()
-        if follow.lower() == "end":
+        follow = input("Feedback (or 'end' to save and quit, 'compact' to summarize memory): ").strip()
+        cmd = follow.lower()
+
+        if cmd == "end":
+            # session_dir = args.session_dir or os.path.join(os.getcwd(), ".ants_sessions")
+            # os.makedirs(session_dir, exist_ok=True)
+            # session_path = os.path.join(session_dir, f"{agent.name}_{_dt.datetime.now():%y%m%d_%H%M%S}.json")
+            # agent.save_session(session_path)
+            # print(f"Session saved to {session_path}")
+            # print(f"Resume with:\n  --resume \"{session_path}\"")
             break
+
+        if cmd == "compact":
+            before = len(agent.memory)
+            agent.memory.summarize(agent.model)
+            after = len(agent.memory)
+            print(f"Memory compacted: {before} → {after} messages")
+            agent.save_session()
+            continue
+
         agent.max_steps += 20  # give more budget
         print(agent.run(follow, reset=False))
+        agent.save_session()
 
     if args.wkdir:
         os.chdir(cwd)
