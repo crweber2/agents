@@ -1015,11 +1015,7 @@ class Agent:
             "function": {
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": {
-                    "type": "object",
-                    "properties": {k: {"type": v["type"], "description": v["description"]} for k, v in tool.inputs.items()},
-                    "required": list(tool.inputs.keys()),
-                },
+                "parameters": parameters,
             },
         }
 
