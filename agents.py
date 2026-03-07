@@ -45,24 +45,25 @@ import os
 import re
 import shutil
 import textwrap
+import time
 import traceback
 import uuid
-from dataclasses import dataclass, field
-from typing import (Any, Callable, Dict, Iterable, List, Mapping, MutableMapping,
-                    MutableSequence, Optional, Sequence, Union)
+from dataclasses import dataclass
+from typing import Any, Dict, List, Mapping, MutableSequence, Optional, Sequence, Union
 
 # local ----------------------------------------------------------------------
 from agent_tools import (
-    Tool, WriteFile, ReadFile, EditFile, EditFile_patch, Delete, RunPython,
-    RunBash, Shell, ViewImage, ListFiles, SearchFiles, MakePlan, Reflect, FinalAnswer, GetUserInput,
-    UpdatePlan, SearchFiles, Shell,
-    ReadPDF, truncate, authorized_types, _RE_TRAILING_COMMA
+    Tool, WriteFile, ReadFile, EditFile, RunPython, Shell, ViewImage,
+    ListFiles, SearchFiles, MakePlan, Reflect, FinalAnswer, GetUserInput,
+    UpdatePlan, ReadPDF, _RE_TRAILING_COMMA
 )
 
 # 3rd-party ------------------------------------------------------------------
-from rich.console import Console, Group
+from rich.console import Console
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.syntax import Syntax
+from rich.table import Table
 from rich.text import Text
 
 _console: Console | None = Console()
@@ -74,10 +75,7 @@ from openai import OpenAI
 ###############################################################################
 
 LOGGER = logging.getLogger("agent")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s ▸ %(message)s")
-
-# Global configuration flags
-CONFIRM_EDITS = False  # Set to True to enable interactive edit approval workflow
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(name)s ▸ %(message)s")
 
 REMINDERS = textwrap.dedent(
     """\
@@ -94,6 +92,71 @@ REMINDERS = textwrap.dedent(
     function calls only, as this can impair your ability to solve the problem and think insightfully.
     """
 )
+
+_LEXER_BY_EXT = {
+    ".bash": "bash",
+    ".c": "c",
+    ".cc": "cpp",
+    ".cpp": "cpp",
+    ".css": "css",
+    ".diff": "diff",
+    ".go": "go",
+    ".html": "html",
+    ".java": "java",
+    ".js": "javascript",
+    ".json": "json",
+    ".md": "markdown",
+    ".patch": "diff",
+    ".py": "python",
+    ".rb": "ruby",
+    ".rs": "rust",
+    ".sh": "bash",
+    ".sql": "sql",
+    ".toml": "toml",
+    ".ts": "typescript",
+    ".tsx": "tsx",
+    ".txt": "text",
+    ".xml": "xml",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+}
+
+
+def _clip(text: Any, max_length: int = 100) -> str:
+    rendered = str(text).strip().replace("\n", " ")
+    if len(rendered) <= max_length:
+        return rendered
+    return rendered[: max_length - 3] + "..."
+
+
+def _console_input(prompt: str) -> str:
+    if _console is not None:
+        return _console.input(prompt)
+    return input(prompt)
+
+
+def _console_print(renderable: Any = "", *, style: str | None = None) -> None:
+    if _console is not None:
+        if isinstance(renderable, str) and style:
+            _console.print(Text(renderable, style=style))
+        else:
+            _console.print(renderable)
+        return
+    if isinstance(renderable, Text):
+        print(renderable.plain)
+    else:
+        print(renderable)
+
+
+def _syntax_lexer(path: str | None) -> str:
+    if not path:
+        return "text"
+    return _LEXER_BY_EXT.get(os.path.splitext(path)[1].lower(), "text")
+
+
+def _render_final_answer_panel(answer: str, title: str = "Final Answer") -> None:
+    body = Text(answer or "", style="white")
+    _console_print(Panel(body, title=title, border_style="green", expand=True))
 ###############################################################################
 # Chat message & memory classes
 ###############################################################################
@@ -198,102 +261,6 @@ class ChatMessage:
         if role == "user":
             return cls("user", content)
         return cls(role or "user", content)
-
-    # ------------------------------------------------------------------
-    # Rich pretty-print helpers - optional
-    # ------------------------------------------------------------------
-    def _pretty(self) -> Panel:  # pragma: no cover - console only
-        assert _console is not None  # appease mypy
-        
-        # Find agent name
-        agent_name = "agent"
-        import inspect
-        frame = inspect.currentframe()
-        while frame:
-            if 'self' in frame.f_locals and hasattr(frame.f_locals['self'], 'name'):
-                if isinstance(frame.f_locals['self'].name, str):
-                    agent_name = frame.f_locals['self'].name
-                    break
-            frame = frame.f_back
-            
-        # Format based on message type
-        if self.role == "assistant" and self.tool_calls:
-            # Process tool calls for display
-            tool_parts = []
-            
-            for tc in self.tool_calls:
-                func_name = tc["function"]["name"]
-                args_raw = tc["function"].get("arguments", "{}")
-                
-                # Format arguments (handle both string and dict forms)
-                try:
-                    args_obj = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
-                    
-                    # Properly handle string values with escaped newlines and long text
-                    if isinstance(args_obj, dict):
-                        for k, v in args_obj.items():
-                            if isinstance(v, str):
-                                # Replace literal \n with actual newlines
-                                if '\\n' in v:
-                                    v = v.replace('\\n', '\n')
-                                
-                                # Wrap long lines
-                                if len(v) > 80:
-                                    # For text with newlines, apply wrapping to each line
-                                    if '\n' in v:
-                                        wrapped_lines = []
-                                        for line in v.split('\n'):
-                                            if len(line) > 80:
-                                                wrapped_lines.append(textwrap.fill(line, width=80))
-                                            else:
-                                                wrapped_lines.append(line)
-                                        v = '\n'.join(wrapped_lines)
-                                    else:
-                                        v = textwrap.fill(v, width=80)
-                                
-                                args_obj[k] = v
-                    
-                    args_str = json.dumps(args_obj, indent=2, ensure_ascii=False)
-                    # Unescape newlines for display
-                    args_str = args_str.replace('\\n', '\n')
-                except Exception:
-                    args_str = str(args_raw)
-                    
-                tool_parts.append(f"Tool: {func_name}\nArguments:\n{args_str}")
-                
-            # Create tool syntax display with word wrapping enabled
-            tool_syntax = Syntax("\n\n".join(tool_parts), "yaml", theme="ansi_dark", word_wrap=True)
-            
-            return Panel(
-                Group(
-                    Text(f"ASSISTANT [{agent_name}]", style="bold cyan"),
-                    Text(self.content or "", style="white"),
-                    Text("\nTOOL CALLS:", style="bold yellow"),
-                    tool_syntax
-                ),
-                title="assistant",
-                border_style="cyan",
-                width=100,
-                expand=True
-            )
-        if self.role == "tool":
-            raw = self.content or ""
-            # Hide giant data-URI strings from view_image (or any tool returning one)
-            if self.name == "view_image" or raw.lstrip().startswith("data:image"):
-                shown = f"<image data-URI - {len(raw):,} characters>"
-            else:
-                shown = raw
-            return Panel(
-                Group(
-                    Text(f"TOOL RESPONSE - {self.name}", style="bold blue"),
-                    Text(shown, style="white")
-                ),
-                title="tool",
-                width=100,
-                border_style="blue"
-            )
-        return Panel(Group(Text(self.role.upper(), style="bold magenta"), Text(self.content or "", style="white")),
-                     border_style="magenta",width=100,title=self.role)
 
 
 class ConversationMemory(MutableSequence[ChatMessage]):
@@ -481,8 +448,9 @@ class Agent:
         name: str = "agent",
         description: str = "Coding agents that completes tasks using tools.",
         max_steps: int = 20,
-        verbosity: int = 1,
+        verbosity: int = 2,
         auto_save: bool = True,
+        trace_enabled: bool = True,
         planning_interval: int | None = None,
         memory_threshold: int | None = None,
         managed_agents: Sequence["Agent"] | None = None,
@@ -567,6 +535,7 @@ class Agent:
         # misc config ----------------------------------------------------
         self.max_steps = max_steps
         self.verbosity = verbosity
+        self.trace_enabled = trace_enabled
         self.planning_interval = planning_interval
         self.memory_threshold = memory_threshold
         self.clear_memory_on_run = clear_memory_on_run
@@ -599,6 +568,9 @@ class Agent:
             self.memory.append(ChatMessage.system(self.system_prompt))
         self.memory.append(ChatMessage.user(task))
         self._log("Task received", level=1)
+        if self.verbosity >= 1:
+            _console_print(Rule(f"{self.name} [{getattr(self.model, 'model_id', 'model')}]"))
+            self._render_event(_clip(task, 140), label="task", style="bright_black")
 
         for local_step in range(1, self.max_steps + 1):
             self._increment_master_step()
@@ -610,8 +582,8 @@ class Agent:
             else:
                 answer = self._take_action()
             
-            # Write memory trace to file if verbosity level is high enough
-            if self.verbosity >= 3:
+            # Write memory trace to file independently of console verbosity
+            if self.trace_enabled:
                 self._dump_trace()
             
             # Auto-summarize memory if it exceeds threshold
@@ -640,42 +612,151 @@ class Agent:
         cls._global_step += 1
 
     def _log(self, msg: str, level: int = 1) -> None:  # noqa: D401
-        if self.verbosity >= level:
+        if self.model.debug and self.verbosity >= level:
             LOGGER.info("#%04d %s - %s", self._global_step, self.name, msg)
 
     # ------------------------------------------------------------------
-    def _append_to_summary(self, tool_name: str, args: dict) -> None:  # noqa: D401
+    def _label_text(self, label: str, style: str = "bold bright_black") -> Text:
+        return Text(label, style=style)
+
+    def _render_event(
+        self,
+        message: str,
+        *,
+        level: int = 1,
+        label: str | None = None,
+        style: str = "white",
+    ) -> None:
+        if self.verbosity < level:
+            return
+        prefix = f"{self._global_step:04d} {self.name}" if label is None else label
+        default_prefix = f"{self._global_step:04d} {self.name}"
+        prefix_width = max(16, len(default_prefix) + 2)
+        prefix_block = f"{prefix:<{prefix_width}}" if prefix else " " * prefix_width
+        wrapped_lines: list[str] = []
+        wrap_width = max(20, ((_console.width if _console is not None else 100) - prefix_width))
+        for raw_line in str(message).splitlines() or [""]:
+            pieces = textwrap.wrap(
+                raw_line,
+                width=wrap_width,
+                replace_whitespace=False,
+                drop_whitespace=False,
+            )
+            wrapped_lines.extend(pieces or [""])
+        if _console is None:
+            lines = [
+                (prefix_block if idx == 0 else " " * prefix_width) + line
+                for idx, line in enumerate(wrapped_lines or [""])
+            ]
+            print("\n".join(lines))
+            return
+        rendered = Text()
+        for idx, line in enumerate(wrapped_lines or [""]):
+            rendered.append(prefix_block if idx == 0 else " " * prefix_width, style="bold bright_black")
+            rendered.append(line, style=style)
+            if idx < len(wrapped_lines) - 1:
+                rendered.append("\n")
+        _console.print(rendered, soft_wrap=True)
+
+    def _render_detail(self, detail: Mapping[str, Any] | None, *, force: bool = False) -> None:
+        if not detail:
+            return
+        if not force and self.verbosity < 2:
+            return
+
+        kind = str(detail.get("kind", "text"))
+        title = str(detail.get("title", "Details"))
+        border_style = str(detail.get("border_style", "blue"))
+
+        if kind == "diff":
+            body = str(detail.get("body", ""))
+            renderable = Syntax(body, "diff", theme="ansi_dark", word_wrap=True)
+        elif kind == "code":
+            body = str(detail.get("body", ""))
+            path = detail.get("path")
+            renderable = Syntax(body, _syntax_lexer(str(path) if path else None), theme="ansi_dark", word_wrap=False)
+        elif kind == "json":
+            rendered = json.dumps(detail.get("data", {}), indent=2, ensure_ascii=False)
+            renderable = Syntax(rendered, "json", theme="ansi_dark", word_wrap=True)
+        elif kind == "plan":
+            table = Table.grid(expand=True, padding=(0, 1))
+            table.add_column(width=12, no_wrap=True)
+            table.add_column(ratio=1)
+            explanation = detail.get("explanation")
+            if explanation:
+                table.add_row(Text("explanation", style="bold cyan"), Text(str(explanation), style="white"))
+            for item in detail.get("plan", []):
+                status = str(item.get("status", "pending"))
+                step = str(item.get("step", ""))
+                status_style = {
+                    "completed": "green",
+                    "in_progress": "yellow",
+                    "pending": "bright_black",
+                }.get(status, "white")
+                table.add_row(Text(status, style=f"bold {status_style}"), Text(step, style="white"))
+            renderable = table
+        else:
+            renderable = Text(str(detail.get("body", "")), style="white")
+
+        _console_print(Panel(renderable, title=title, border_style=border_style, expand=True))
+
+    def _render_assistant_message(self, assistant_msg: ChatMessage) -> None:
+        content = (assistant_msg.content or "").strip()
+        if not content:
+            return
+        if assistant_msg.tool_calls:
+            self._render_event(content, label="reason", style="bright_black")
+            return
+        if self.verbosity >= 2:
+            self._render_detail(
+                {
+                    "kind": "text",
+                    "title": f"Assistant [{self.name}]",
+                    "body": content,
+                    "border_style": "cyan",
+                },
+                force=True,
+            )
+        else:
+            self._render_event(_clip(content, 120), style="white")
+
+    def _render_usage(self, assistant_msg: ChatMessage) -> None:
+        if self.verbosity < 2 or not getattr(assistant_msg, "usage", None):
+            return
+        tokens_used = getattr(assistant_msg.usage, "total_tokens", None)
+        if tokens_used is not None:
+            self._render_event(f"Tokens used: {tokens_used}", level=2, label="", style="bright_black")
+
+    def _prompt_for_approval(self, tool: Tool, args: dict[str, Any], preview: Mapping[str, Any] | None) -> tuple[bool, str | None]:
+        if preview:
+            self._render_detail(preview, force=True)
+        prompt = f"Approve {tool.name}: {tool.describe_call(**args)}? [y/N/m or feedback] "
+        while True:
+            response = _console_input(prompt).strip()
+            lowered = response.lower()
+            if lowered == "y":
+                return True, None
+            if lowered == "m":
+                self._render_detail(
+                    {
+                        "kind": "json",
+                        "title": f"Arguments for {tool.name}",
+                        "data": args,
+                        "border_style": "magenta",
+                    },
+                    force=True,
+                )
+                continue
+            if lowered in {"", "n"}:
+                feedback = _console_input("Feedback (optional): ").strip()
+                return False, feedback or None
+            return False, response
+
+    def _append_to_summary(self, summary: str) -> None:  # noqa: D401
         """Append a line to the summary.txt file showing the agent action."""
         os.makedirs(self._trace_dir, exist_ok=True)
         summary_file = os.path.join(self._trace_dir, "summary.txt")
-        
-        # Format arguments for display
-        args_str = ""
-        if args:
-            # Format args compactly or truncate if too long
-            if len(str(args)) > 50:
-                # For longer args, just show key info if possible
-                if 'filename' in args:
-                    arg_preview = f'filename="{args["filename"]}"'
-                    if 'code' in args and len(str(args['code'])) > 20:
-                        arg_preview += ',code=".."'
-                    args_str = f"({arg_preview})"
-                else:
-                    args_str = "(...)"
-            else:
-                # For shorter args, include everything
-                args_parts = []
-                for k, v in args.items():
-                    if isinstance(v, str):
-                        args_parts.append(f'{k}="{v}"')
-                    else:
-                        args_parts.append(f'{k}={v}')
-                args_str = f"({', '.join(args_parts)})"
-        
-        # Create the summary line
-        summary_line = f"[{self._global_step}] {self.name} > {tool_name}{args_str}\n"
-        
-        # Append to the summary file
+        summary_line = f"[{self._global_step}] {self.name} > {summary}\n"
         with open(summary_file, "a", encoding="utf-8") as f:
             f.write(summary_line)
             
@@ -826,7 +907,7 @@ class Agent:
             tools = [self._tool_to_openai(t) for t in self.tools.values()]
         else:
             tools = [self._tool_to_openai(t) for t in self.tools.values() if t.name in specific_tools]
-        msg = self.model.chat(messages=self.memory.to_openai(), tools=tools)#[self._tool_to_openai(t) for t in self.tools.values()])
+        msg = self.model.chat(messages=self.memory.to_openai(), tools=tools)
         response_content = msg.content
         # tool_calls = getattr(msg, "tool_calls", None)
         tool_calls = _normalise_tool_calls(getattr(msg, "tool_calls", None))
@@ -861,11 +942,8 @@ class Agent:
         if hasattr(msg, 'usage'):
             assistant_msg.usage = msg.usage
         self.memory.append(assistant_msg)
-        if self.verbosity >= 2 and _console is not None:
-            _console.print(assistant_msg._pretty())
-            if hasattr(msg, 'usage') and msg.usage:
-                tokens_used = getattr(msg.usage, 'total_tokens', 'unknown')
-                _console.print(f"[dim]Tokens used: {tokens_used}[/dim]")
+        self._render_assistant_message(assistant_msg)
+        self._render_usage(assistant_msg)
         # ---- dispatch tool calls --------------------------------------
         if not tool_calls:  # No tool was called - instruct agent to use a tool
             self._log("No tool call used, instructing the agent to try again", 1)
@@ -874,7 +952,7 @@ class Agent:
             return None
             
         # Dump trace before processing any tool calls to capture pre-execution state
-        if self.verbosity >= 3:
+        if self.trace_enabled:
             self._dump_trace()
             
         final_answer: str | None = None
@@ -887,14 +965,51 @@ class Agent:
             if target is None:
                 err = f"Unknown tool '{name}'"
                 self.memory.append(ChatMessage.tool(name=name, tool_call_id=tc.get("id", "call_0"), result=err))
+                self._render_event(err, label="", style="red")
                 continue
-                
-            # Log this tool call to the summary file
-            self._append_to_summary(name, args)
+
             try:
-                result = target(**args)
+                call_summary = target.describe_call(**args)
+            except Exception:
+                call_summary = name
+            call_display = f"{name}: {call_summary}"
+            self._append_to_summary(call_display)
+            self._render_event(call_display, style="cyan")
+
+            preview: Mapping[str, Any] | None = None
+            preview_shown = False
+            try:
+                requires_confirmation = target.needs_confirmation(**args)
+            except Exception:
+                requires_confirmation = False
+            if requires_confirmation or self.verbosity >= 2:
+                try:
+                    preview = target.build_preview(**args)
+                except Exception as exc:
+                    preview = {
+                        "kind": "text",
+                        "title": f"Preview unavailable for {name}",
+                        "body": str(exc),
+                        "border_style": "red",
+                    }
+
+            approved = True
+            rejection_feedback: str | None = None
+            if requires_confirmation:
+                approved, rejection_feedback = self._prompt_for_approval(target, args, preview)
+                preview_shown = preview is not None
+
+            try:
+                if approved:
+                    tool_started = time.perf_counter()
+                    result = target(**args)
+                    elapsed_ms = int((time.perf_counter() - tool_started) * 1000)
+                else:
+                    result = target.rejection_result(rejection_feedback, **args)
+                    elapsed_ms = 0
             except Exception as exc:  # pragma: no cover - runtime errors
                 result = f"ToolError[{name}]: {exc} ({traceback.format_exc().splitlines()[-1]})"
+                elapsed_ms = 0
             
             content_for_log = str(result)
 
@@ -956,8 +1071,44 @@ class Agent:
                 
             if name == "final_answer":
                 final_answer = args.get("answer", str(result))
-            if self.verbosity >= 2 and _console is not None:
-                _console.print(self.memory[-1]._pretty())
+
+            try:
+                result_summary = target.describe_result(result, **args)
+            except Exception:
+                lines = str(result).splitlines()
+                result_summary = _clip(lines[0] if lines else str(result), 120)
+
+            if elapsed_ms:
+                result_summary = f"{result_summary} ({elapsed_ms} ms)"
+            lowered_summary = result_summary.lower()
+            if "rejected by user" in lowered_summary:
+                result_style = "yellow"
+            elif (
+                lowered_summary.startswith("error")
+                or "toolerror" in lowered_summary
+                or "failed" in lowered_summary
+                or "not found" in lowered_summary
+                or "invalid" in lowered_summary
+                or "timed out" in lowered_summary
+            ):
+                result_style = "red"
+            else:
+                result_style = "green"
+            self._render_event(result_summary, label="", style=result_style)
+
+            if preview and not preview_shown and self.verbosity >= 2 and preview.get("kind") in {"diff", "code"}:
+                self._render_detail(preview)
+
+            try:
+                result_detail = target.build_result_details(result, **args)
+            except Exception as exc:
+                result_detail = {
+                    "kind": "text",
+                    "title": f"{name} details unavailable",
+                    "body": str(exc),
+                    "border_style": "red",
+                }
+            self._render_detail(result_detail)
 
         # Feed images back to the model so it can "see" them
         if image_parts:
@@ -1101,6 +1252,7 @@ class Agent:
                 "description": self.description,
                 "max_steps": self.max_steps,
                 "verbosity": self.verbosity,
+                "trace_enabled": self.trace_enabled,
                 "planning_interval": self.planning_interval,
                 "memory_threshold": self.memory_threshold,
                 "include_function_thoughts": self.include_function_thoughts,
@@ -1126,8 +1278,8 @@ class Agent:
 
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.snapshot(), f, indent=2)
-        print(f"Session saved to {path}")
-        print(f"Resume with:\n  --resume \"{path}\"")
+        _console_print(f"Session saved to {path}", style="bright_black")
+        _console_print(f"Resume with:\n  --resume \"{path}\"", style="bright_black")
 
     @staticmethod
     def load_session(path: str) -> dict:  # noqa: D401
@@ -1143,7 +1295,8 @@ class Agent:
             name=ag.get("name", "agent"),
             description=ag.get("description", ""),
             max_steps=ag.get("max_steps", 20),
-            verbosity=ag.get("verbosity", 1),
+            verbosity=ag.get("verbosity", 2),
+            trace_enabled=ag.get("trace_enabled", True),
             planning_interval=ag.get("planning_interval"),
             memory_threshold=ag.get("memory_threshold"),
             include_function_thoughts=ag.get("include_function_thoughts", True),
@@ -1189,17 +1342,21 @@ def main() -> None:  # noqa: D401
     parser.add_argument("-d", "--debug", action="store_true", help="Verbose OpenAI request/response logging")
     parser.add_argument("-l", "--local", action="store_true",
                         help="Use a local LLM instead of the OpenAI API for the executor agent")
-    parser.add_argument("-v", "--verbosity", type=int, default=3, choices=range(0,4),
-                        help="Verbosity level: 0-quiet 1-steps 2-rich 3-trace (default 2)")
+    parser.add_argument("-v", "--verbosity", type=int, default=2, choices=range(0,4),
+                        help="Verbosity level: 0-quiet 1-timeline 2-details 3-verbose (default 2)")
     parser.add_argument("-m", "--model", default="gpt-4.1", help="OpenAI model")
     parser.add_argument("-w", "--wkdir", action="store_true", help="move to work dir")
     parser.add_argument("--cp", default="", help="Copy file or directory to wkdir")
     parser.add_argument("-c", "--confirm-edits", action="store_true", 
-                        help="Require confirmation before editing or deleting files")
+                        help="Require confirmation before writing, editing, or deleting files")
+    parser.add_argument("--confirm-shell", action="store_true",
+                        help="Require confirmation before running shell commands")
     parser.add_argument("-p", "--planning",default=0,type=int,
                         help="Planning interval")
     parser.add_argument("--confirm-plan", action="store_true", 
                         help="Ask for confirmation after making initial plan")
+    parser.add_argument("--no-trace", action="store_true",
+                        help="Disable per-step trace file dumps")
     parser.add_argument( "--end", action="store_true", 
                         help="End on first final_answer")
     parser.add_argument("--multi", action="store_true",
@@ -1212,6 +1369,10 @@ def main() -> None:  # noqa: D401
 
     args = parser.parse_args()
 
+    if args.debug:
+        logging.getLogger("agent").setLevel(logging.INFO)
+        logging.getLogger("agent.tools").setLevel(logging.INFO)
+
 
 
     # Resolve resume path if requested
@@ -1221,9 +1382,9 @@ def main() -> None:  # noqa: D401
             session_dir = args.session_dir or os.path.join(os.getcwd(), ".ants_sessions")
             resume_path = _find_latest_session(session_dir)
             if resume_path:
-                print(f"Resuming latest session: {resume_path}")
+                _console_print(f"Resuming latest session: {resume_path}", style="bright_black")
             else:
-                print(f"No session found in {session_dir}; starting fresh.")
+                _console_print(f"No session found in {session_dir}; starting fresh.", style="bright_black")
         else:
             resume_path = args.resume
 
@@ -1243,7 +1404,7 @@ def main() -> None:  # noqa: D401
             user_task = args.task
         else:
             # Fall back to prompting if no task provided
-            user_task = input("Enter your task: ")
+            user_task = _console_input("Enter your task: ")
 
 
     if args.wkdir:
@@ -1253,7 +1414,7 @@ def main() -> None:  # noqa: D401
 
         workdir = os.path.join(cwd,'work/tmp_'+_dt.datetime.now().strftime('%y%m%d_%H%M'))
         os.makedirs(workdir,exist_ok=True)
-        print(f'moving to {workdir}')
+        _console_print(f"moving to {workdir}", style="bright_black")
         
         # Handle --cp flag if it's provided
         if args.cp:
@@ -1264,14 +1425,14 @@ def main() -> None:  # noqa: D401
                 
                 if os.path.isdir(source_path):
                     # For directories, use copytree
-                    print(f'copying directory {source_path} to {dest_path}')
+                    _console_print(f"copying directory {source_path} to {dest_path}", style="bright_black")
                     shutil.copytree(source_path, dest_path)
                 else:
                     # For files, use copy2 (preserves metadata)
-                    print(f'copying file {source_path} to {dest_path}')
+                    _console_print(f"copying file {source_path} to {dest_path}", style="bright_black")
                     shutil.copy2(source_path, dest_path)
             else:
-                print(f'Warning: Source path {source_path} not found, skipping copy')
+                _console_print(f"Warning: Source path {source_path} not found, skipping copy", style="yellow")
         
         os.chdir(workdir)
 
@@ -1281,8 +1442,8 @@ def main() -> None:  # noqa: D401
     #     MakePlan(), Reflect(), ListFiles(), FinalAnswer()
     # ]
     tools_all = [
-        WriteFile(), ReadFile(), SearchFiles(), EditFile(confirm_edits=args.confirm_edits), #EditFile_patch(),# , RunPython(),
-        Shell(), UpdatePlan(), ListFiles(), FinalAnswer()
+        WriteFile(confirm_edits=args.confirm_edits), ReadFile(), SearchFiles(), EditFile(confirm_edits=args.confirm_edits), #EditFile_patch(),# , RunPython(),
+        Shell(confirm_commands=args.confirm_shell), UpdatePlan(), ListFiles(), FinalAnswer()
     ]
 
     if not args.multi:
@@ -1302,11 +1463,13 @@ def main() -> None:  # noqa: D401
         if args.chdir_on_resume and "cwd" in session and os.path.isdir(session["cwd"]):
             os.chdir(session["cwd"])
         agent = Agent.from_session(session, model=model, tools=tools_all)
+        agent.trace_enabled = not args.no_trace
     else:
         agent = Agent(tools=tools_all,
                         model=model,
                         max_steps=25,
                         verbosity=args.verbosity,
+                        trace_enabled=not args.no_trace,
                         planning_interval=args.planning,
                         name="code_agent",
                         description="Writes/tests Python projects")
@@ -1351,7 +1514,7 @@ def main() -> None:  # noqa: D401
             and report the results to the user.''')
 
         tools_manager = [
-            ListFiles(), SearchFiles(), MakePlan(),Reflect(), ReadFile(), RunPython(), Shell(), FinalAnswer()
+            ListFiles(), SearchFiles(), MakePlan(),Reflect(), ReadFile(), RunPython(), Shell(confirm_commands=args.confirm_shell), FinalAnswer()
         ]
         if args.vision:
             tools_manager.insert(-1,ReadPDF())
@@ -1377,6 +1540,7 @@ def main() -> None:  # noqa: D401
             model=model,  # Using the stronger model for evaluation
             system_message=judge_prompt,
             verbosity=args.verbosity,
+            trace_enabled=not args.no_trace,
             max_steps=15,
             name="judge_agent",
             description="Evaluates work against success criteria and provides objective assessment.",
@@ -1390,6 +1554,7 @@ def main() -> None:  # noqa: D401
                         managed_agents=[agent_code,judge_agent],
                         max_steps=25,
                         verbosity=args.verbosity,
+                        trace_enabled=not args.no_trace,
                         planning_interval=args.planning,
                         name="manager_agent",
                         description="Magnages coding agents")
@@ -1399,12 +1564,12 @@ def main() -> None:  # noqa: D401
         
     if user_task:
         result = agent.run(user_task, reset=False if resume_path else None)
-        print("\n=== FINAL ANSWER ===\n", result)
+        _render_final_answer_panel(result)
         agent.save_session()
 
     # optional interactive loop -------------------------------------------
     while True and not args.end:
-        follow = input("Feedback (or 'end' to save and quit, 'compact' to summarize memory): ").strip()
+        follow = _console_input("Feedback (or 'end' to save and quit, 'compact' to summarize memory): ").strip()
         cmd = follow.lower()
 
         if cmd == "end":
@@ -1420,12 +1585,12 @@ def main() -> None:  # noqa: D401
             before = len(agent.memory)
             agent.memory.summarize(agent.model)
             after = len(agent.memory)
-            print(f"Memory compacted: {before} → {after} messages")
+            _console_print(f"Memory compacted: {before} -> {after} messages", style="bright_black")
             agent.save_session()
             continue
 
         agent.max_steps += 20  # give more budget
-        print(agent.run(follow, reset=False))
+        _render_final_answer_panel(agent.run(follow, reset=False), title="Assistant")
         agent.save_session()
 
     if args.wkdir:

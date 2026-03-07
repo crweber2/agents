@@ -42,6 +42,7 @@ from __future__ import annotations
 
 # stdlib ---------------------------------------------------------------------
 import base64
+import difflib
 import json
 import logging
 import mimetypes
@@ -86,6 +87,117 @@ authorized_types = {
 
 _RE_TRAILING_COMMA = re.compile(r",\s*([}\]])")
 
+
+def _clip(text: str, max_length: int = 90) -> str:
+    text = str(text).strip().replace("\n", " ")
+    if len(text) <= max_length:
+        return text
+    return text[: max_length - 3] + "..."
+
+
+def _line_count(text: str) -> int:
+    if not text:
+        return 0
+    return text.count("\n") + 1
+
+
+def _safe_read_text(path: str) -> str | None:
+    try:
+        with open(path, "r", encoding="utf-8") as fp:
+            return fp.read()
+    except (FileNotFoundError, IsADirectoryError, UnicodeDecodeError, OSError):
+        return None
+
+
+def _build_unified_diff(original: str, updated: str, *, path: str, proposed_label: str | None = None) -> str:
+    proposed = proposed_label or f"{path} (proposed)"
+    diff = difflib.unified_diff(
+        original.splitlines(),
+        updated.splitlines(),
+        fromfile=path,
+        tofile=proposed,
+        lineterm="",
+    )
+    return "\n".join(diff)
+
+
+def _stringify_command(command: Union[str, list[str]]) -> str:
+    if isinstance(command, str):
+        return command
+    return " ".join(command)
+
+
+def _render_command_result(
+    *,
+    command_display: str,
+    cwd: str,
+    returncode: int,
+    output: str,
+    max_chars: int,
+    notes: Optional[list[str]] = None,
+    timed_out: bool = False,
+) -> str:
+    header = []
+    if notes:
+        header.extend(notes)
+    header.extend(
+        [
+            f"[cwd] {os.path.abspath(cwd)}",
+            f"[command] {command_display}",
+            f"[exit code] {returncode}",
+        ]
+    )
+    if timed_out:
+        header.append("[status] command timed out")
+    elif returncode != 0:
+        header.append("[status] command failed (non-zero exit)")
+    rendered = "\n".join(header)
+    if output:
+        rendered += "\n" + output
+    return truncate(rendered, max_length=max_chars)
+
+
+def _parse_command_result(result: str) -> dict[str, Any]:
+    parsed: dict[str, Any] = {
+        "notes": [],
+        "cwd": None,
+        "command": None,
+        "exit_code": None,
+        "status": None,
+        "output": "",
+    }
+    lines = str(result).splitlines()
+    body_start = 0
+    for idx, line in enumerate(lines):
+        if line.startswith("[cwd] "):
+            parsed["cwd"] = line[6:]
+        elif line.startswith("[command] "):
+            parsed["command"] = line[10:]
+        elif line.startswith("[exit code] "):
+            try:
+                parsed["exit_code"] = int(line[12:])
+            except ValueError:
+                parsed["exit_code"] = None
+        elif line.startswith("[status] "):
+            parsed["status"] = line[9:]
+        elif line.startswith("[note] ") or line.startswith("[justification] "):
+            parsed["notes"].append(line)
+        else:
+            body_start = idx
+            break
+    else:
+        body_start = len(lines)
+    parsed["output"] = "\n".join(lines[body_start:]).strip()
+    return parsed
+
+
+def _tail(text: str, max_lines: int = 40) -> str:
+    lines = str(text).splitlines()
+    if len(lines) <= max_lines:
+        return "\n".join(lines)
+    omitted = len(lines) - max_lines
+    return f"... {omitted} line(s) omitted ...\n" + "\n".join(lines[-max_lines:])
+
 ###############################################################################
 # Tool base class and built-in tools
 ###############################################################################
@@ -121,6 +233,37 @@ class Tool:
 
     def forward(self, *_: Any, **__: Any) -> Any:  # noqa: D401
         raise NotImplementedError("Tools must implement forward()")
+
+    def describe_call(self, **kwargs: Any) -> str:
+        label = self.name.replace("_", " ")
+        return label[:1].upper() + label[1:]
+
+    def describe_result(self, result: Any, **kwargs: Any) -> str:
+        if isinstance(result, dict):
+            if "error" in result:
+                return str(result["error"])
+            keys = ", ".join(sorted(result.keys()))
+            return f"Returned object ({keys})"
+        if isinstance(result, list):
+            return f"Returned {len(result)} item(s)"
+        text = str(result).strip()
+        if not text:
+            return "Done"
+        return _clip(text.splitlines()[0])
+
+    def build_preview(self, **kwargs: Any) -> dict[str, Any] | None:
+        return None
+
+    def build_result_details(self, result: Any, **kwargs: Any) -> dict[str, Any] | None:
+        return None
+
+    def needs_confirmation(self, **kwargs: Any) -> bool:
+        return False
+
+    def rejection_result(self, feedback: str | None = None, **kwargs: Any) -> str:
+        if feedback:
+            return f"{self.describe_call(**kwargs)} rejected by user. Feedback: {feedback}"
+        return f"{self.describe_call(**kwargs)} rejected by user."
 
 
 # ――― Filesystem & execution tools ------------------------------------------
@@ -159,6 +302,44 @@ class WriteFile(Tool):
     }
     output_type = "string"
 
+    def describe_call(self, *, filename: str, **_: Any) -> str:
+        return filename
+
+    def describe_result(self, result: Any, *, filename: str, code: str, **_: Any) -> str:
+        text = str(result)
+        lowered = text.lower()
+        if "rejected by user" in lowered or text.startswith("Error") or text.startswith("ToolError"):
+            return text
+        return f"Wrote {_line_count(code)} line(s) to {filename}"
+
+    def build_preview(self, *, filename: str, code: str, **_: Any) -> dict[str, Any] | None:
+        if os.path.isdir(filename):
+            return {
+                "kind": "text",
+                "title": f"Cannot write {filename}",
+                "body": f"{filename} is an existing directory.",
+            }
+        original = _safe_read_text(filename)
+        if original is None:
+            return {
+                "kind": "code",
+                "title": f"New file: {filename}",
+                "body": code,
+                "path": filename,
+            }
+        diff_text = _build_unified_diff(original, code, path=filename)
+        if not diff_text:
+            diff_text = f"No content changes for {filename}."
+        return {
+            "kind": "diff",
+            "title": f"Proposed write: {filename}",
+            "body": diff_text,
+            "path": filename,
+        }
+
+    def needs_confirmation(self, **_: Any) -> bool:
+        return bool(self.config.get("confirm_edits", False))
+
     def forward(self, *, filename: str, code: str) -> str:  # noqa: D401
         os.makedirs(os.path.dirname(filename) or ".", exist_ok=True)
         with open(filename, "w", encoding="utf-8") as fp:
@@ -189,6 +370,9 @@ class ReadFile(Tool):
     - Binary or very large files (>20 kB) are truncated with a notice.
     - If the user already pasted the file contents, reuse that copy
       instead of reading the file again.
+    - If you've recently written the file or read it, you do NOT need to read_file again.
+    - Only use start_line/end_line if you expect the file to be large, otherwise omit and 
+      read the full file.
     """
     inputs = {
         "filename": {"type": "string", "description": "Path."},
@@ -196,6 +380,28 @@ class ReadFile(Tool):
         "end_line": {"type": "integer", "description": "Optional 1-based inclusive end line.", "required": False},
     }
     output_type = "string"
+
+    def describe_call(
+        self,
+        *,
+        filename: str,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None,
+        **_: Any,
+    ) -> str:
+        if start_line is None and end_line is None:
+            return filename
+        if end_line is None:
+            return f"{filename} from line {start_line}"
+        return f"{filename} lines {start_line or 1}-{end_line}"
+
+    def describe_result(self, result: Any, *, filename: str, **_: Any) -> str:
+        text = str(result)
+        if text.startswith("File not found") or text.startswith("Invalid") or text.startswith("Cannot decode"):
+            return text
+        if " lines " in text.splitlines()[0]:
+            return _clip(text.splitlines()[0], 110)
+        return f"Read {_line_count(text)} line(s) from {filename}"
 
     def forward(
         self,
@@ -275,11 +481,44 @@ class EditFile(Tool):
     }
     output_type = "string"
 
+    def describe_call(self, *, filename: str, **_: Any) -> str:
+        return filename
+
+    def describe_result(self, result: Any, *, filename: str, **_: Any) -> str:
+        text = str(result)
+        if text.startswith("Replaced "):
+            return text.replace(" occurrence(s)", " change(s)")
+        return text
+
+    def build_preview(
+        self,
+        *,
+        filename: str,
+        search_string: str,
+        replace_string: str,
+        **_: Any,
+    ) -> dict[str, Any] | None:
+        original = _safe_read_text(filename)
+        if original is None:
+            return None
+        patched = original.replace(search_string, replace_string)
+        if original == patched:
+            return {
+                "kind": "text",
+                "title": f"No proposed edits for {filename}",
+                "body": "No matches - nothing changed.",
+            }
+        return {
+            "kind": "diff",
+            "title": f"Proposed edit: {filename}",
+            "body": _build_unified_diff(original, patched, path=filename),
+            "path": filename,
+        }
+
+    def needs_confirmation(self, **_: Any) -> bool:
+        return bool(self.config.get("confirm_edits", False))
+
     def forward(self, *, filename: str, search_string: str, replace_string: str) -> str:  # noqa: D401
-        """
-        Show a colored unified diff of the proposed changes, optionally ask for approval,
-        and apply the changes if approved or if confirmation is disabled.
-        """
         if not os.path.isfile(filename):
             return f"File not found: {filename}"
         with open(filename, "r", encoding="utf-8") as fp:
@@ -287,36 +526,7 @@ class EditFile(Tool):
         patched = original.replace(search_string, replace_string)
         if original == patched:
             return "No matches - nothing changed."
-            
-        # Show diff when verbose
-        if LOGGER.level <= logging.INFO:
-            import difflib
-            diff = difflib.unified_diff(
-                original.splitlines(), patched.splitlines(),
-                fromfile=filename, tofile=f"{filename} (proposed)",
-                lineterm=""
-            )
-            diff_text = "\n".join(diff)
-            try:
-                # Try to use rich for colored output if available
-                try:
-                    from rich.console import Console
-                    from rich.syntax import Syntax
-                    console = Console()
-                    console.print(Syntax(diff_text, "diff", theme="ansi_dark"))
-                except ImportError:
-                    print(diff_text)
-                    
-                # Interactive confirmation (if enabled)
-                confirm_edits = self.config.get("confirm_edits", False)
-                if confirm_edits:
-                    ans = input("Apply these changes? [y/N] ").strip().lower()
-                    if ans != "y":
-                        feedback = input("(Optional) feedback for the agent, or just press ↵ to skip: ")
-                        return f"Edit rejected by user. Feedback: {feedback or '<none>'}"
-            except Exception as e:
-                LOGGER.error(f"Error displaying diff: {e}")
-        
+
         # Apply changes
         with open(filename, "w", encoding="utf-8") as fp:
             fp.write(patched)
@@ -386,6 +596,19 @@ class EditFile_patch(Tool):
     inputs = {"patch": {"type": "string", "description": "Diff text beginning with *** Begin Patch"}} 
     output_type = "string"
 
+    def describe_call(self, **_: Any) -> str:
+        return "patch"
+
+    def build_preview(self, *, patch: str, **_: Any) -> dict[str, Any] | None:
+        return {
+            "kind": "diff",
+            "title": "Proposed patch",
+            "body": patch,
+        }
+
+    def needs_confirmation(self, **_: Any) -> bool:
+        return bool(self.config.get("confirm_edits", False))
+
     def forward(self, *, patch: str) -> str:
         import subprocess, tempfile, textwrap, os, sys
         with tempfile.NamedTemporaryFile("w", delete=False) as tf:
@@ -401,7 +624,7 @@ class EditFile_patch(Tool):
 
 class RunPython(Tool):
     name = "run_python"
-    description = """Execute a Python script in a subprocess and stream stdout/stderr live.
+    description = """Execute a Python script in a subprocess and capture combined stdout/stderr.
 
     When to use:
     - Run an existing *.py* file end‑to‑end.
@@ -424,7 +647,7 @@ class RunPython(Tool):
 
     Special notes:
     - Uses the same Python interpreter as the host process.
-    - Output is streamed in real‑time; the return value is truncated to the first 20 kB.
+    - Output is captured and returned as a single result, truncated to the first 20 kB.
     - If execution exceeds max_time, the process is terminated with a timeout message.
     - Command-line arguments are passed as-is to the script.
     """
@@ -435,81 +658,82 @@ class RunPython(Tool):
     }
     output_type = "string"
 
+    def describe_call(self, *, filename: str, args: str = "", **_: Any) -> str:
+        suffix = f" {args}" if args else ""
+        return f"{filename}{suffix}"
+
+    def describe_result(self, result: Any, *, filename: str, **_: Any) -> str:
+        parsed = _parse_command_result(str(result))
+        exit_code = parsed.get("exit_code")
+        if exit_code is None:
+            return _clip(str(result).splitlines()[0])
+        if exit_code == 0:
+            return f"Python run succeeded for {filename}"
+        return f"Python run failed for {filename} (exit {exit_code})"
+
+    def build_result_details(self, result: Any, *, filename: str, **_: Any) -> dict[str, Any] | None:
+        parsed = _parse_command_result(str(result))
+        exit_code = parsed.get("exit_code")
+        output = parsed.get("output") or ""
+        if exit_code in (None, 0) and not output:
+            return None
+        if exit_code == 0:
+            return None
+        body = _tail(output)
+        return {
+            "kind": "text",
+            "title": f"Python output: {filename}",
+            "body": body or "(no output)",
+        }
+
     def forward(self, *, filename: str, args: str = "", max_time: float = 300) -> str:  # noqa: D401
-        import time, signal, threading
-        
         if not os.path.isfile(filename):
             return f"File not found: {filename}"
-        
-        # Build command with optional arguments
+
         cmd = [sys.executable, filename]
         if args:
-            # Split the args string properly to handle quoted arguments
             import shlex
             cmd.extend(shlex.split(args))
-            
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        output: list[str] = []
-        terminated = False
-        
-        # Set up timer to kill process if it exceeds max_time
-        if max_time is not None:
-            def kill_process():
-                nonlocal terminated
-                terminated = True
-                output.append(f"\n[TIMEOUT] Process terminated after {max_time} seconds\n")
-                # Try SIGTERM first for graceful shutdown
-                try:
-                    proc.terminate()
-                    # Give it a moment to terminate gracefully
-                    time.sleep(0.5)
-                    if proc.poll() is None:  # If still running
-                        proc.kill()  # Force kill
-                except Exception:
-                    # If terminate fails, try to force kill
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                        
-            # Set up timer
-            timer = threading.Timer(max_time, kill_process)
-            timer.daemon = True  # Don't let timer block program exit
-            timer.start()
-        
+
+        cwd = "."
+        command_display = _stringify_command(cmd)
+        max_chars = 20000
         try:
-            assert proc.stdout is not None
-            for line in proc.stdout:  # pragma: no cover - interactive run
-                print(line, end="")
-                output.append(line)
-                # Check if process was terminated by timer
-                if terminated:
-                    break
-            proc.wait(timeout=0.5)  # Small timeout for final wait
-        except subprocess.TimeoutExpired:
-            # This happens if proc.wait times out
-            pass
-        finally:
-            # Clean up timer if it's still active
-            if max_time is not None:
-                timer.cancel()
-            # Ensure process is terminated
-            if proc.poll() is None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=0.5)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-        
-        return truncate("".join(output))
+            result = subprocess.run(
+                cmd,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=max_time,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            output = exc.output or ""
+            output_str = output.decode("utf-8", errors="replace") if isinstance(output, bytes) else str(output)
+            return _render_command_result(
+                command_display=command_display,
+                cwd=cwd,
+                returncode=124,
+                output=output_str,
+                max_chars=max_chars,
+                timed_out=True,
+            )
+        except Exception as exc:
+            return f"Error running python: {exc}"
+
+        return _render_command_result(
+            command_display=command_display,
+            cwd=cwd,
+            returncode=result.returncode,
+            output=result.stdout or "",
+            max_chars=max_chars,
+        )
 
 
 class RunBash(Tool):
     name = "run_bash"
-    description = """Run an arbitrary shell command and stream its combined stdout/stderr.
+    description = """Run an arbitrary shell command and capture its combined stdout/stderr.
 
     When to use:
     - Compile code, start servers, install packages, or any CLI task
@@ -527,20 +751,54 @@ class RunBash(Tool):
     Special notes:
     - Executes with *shell=True* (/bin/bash -c on Unix).
     - Use absolute paths or prefix with `cd … &&` for other directories.
-    - Output is truncated to 20 kB in the return value.
+    - Output is captured and truncated to 20 kB in the return value.
     """
     inputs = {"command": {"type": "string", "description": "Command string."}}
     output_type = "string"
 
+    def describe_call(self, *, command: str, **_: Any) -> str:
+        return _clip(command, 80)
+
+    def describe_result(self, result: Any, *, command: str, **_: Any) -> str:
+        parsed = _parse_command_result(str(result))
+        exit_code = parsed.get("exit_code")
+        if exit_code is None:
+            return _clip(str(result).splitlines()[0])
+        cmd_label = _clip(command, 50)
+        if exit_code == 0:
+            return f"{cmd_label} succeeded"
+        return f"{cmd_label} failed (exit {exit_code})"
+
+    def build_result_details(self, result: Any, **_: Any) -> dict[str, Any] | None:
+        parsed = _parse_command_result(str(result))
+        if parsed.get("exit_code") in (None, 0):
+            return None
+        output = parsed.get("output") or ""
+        return {
+            "kind": "text",
+            "title": "Shell output",
+            "body": _tail(output) or "(no output)",
+        }
+
     def forward(self, *, command: str) -> str:  # noqa: D401
-        proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        output: list[str] = []
-        assert proc.stdout is not None
-        for line in proc.stdout:  # pragma: no cover - interactive run
-            print(line, end="")
-            output.append(line)
-        proc.wait()
-        return truncate("".join(output))
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+        except Exception as exc:
+            return f"Error running command: {exc}"
+        return _render_command_result(
+            command_display=command,
+            cwd=".",
+            returncode=result.returncode,
+            output=result.stdout or "",
+            max_chars=20000,
+        )
 
 
 class Shell(Tool):
@@ -587,6 +845,69 @@ class Shell(Tool):
         "justification": {"type": "string", "description": "Reason for escalation (optional).", "required": False},
     }
     output_type = "string"
+
+    def describe_call(
+        self,
+        *,
+        command: Union[str, list[str]],
+        workdir: Optional[str] = None,
+        **_: Any,
+    ) -> str:
+        cmd = _clip(_stringify_command(command), 90)
+        if workdir:
+            return f"{cmd} [cwd={workdir}]"
+        return cmd
+
+    def describe_result(self, result: Any, *, command: Union[str, list[str]], **_: Any) -> str:
+        parsed = _parse_command_result(str(result))
+        exit_code = parsed.get("exit_code")
+        if exit_code is None:
+            return _clip(str(result).splitlines()[0])
+        cmd_label = _clip(_stringify_command(command), 50)
+        if exit_code == 0:
+            return f"{cmd_label} succeeded"
+        return f"{cmd_label} failed (exit {exit_code})"
+
+    def build_preview(
+        self,
+        *,
+        command: Union[str, list[str]],
+        workdir: Optional[str] = None,
+        env: Optional[dict[str, Any]] = None,
+        stdin: Optional[str] = None,
+        **_: Any,
+    ) -> dict[str, Any] | None:
+        if not self.config.get("confirm_commands", False):
+            return None
+        lines = [f"Command: {_stringify_command(command)}", f"Working directory: {os.path.abspath(workdir or '.')}"]
+        if env:
+            lines.append("Environment overrides:")
+            for key, value in env.items():
+                lines.append(f"  {key}={value}")
+        if stdin:
+            lines.append("")
+            lines.append("stdin:")
+            lines.append(stdin)
+        return {
+            "kind": "text",
+            "title": "Proposed shell command",
+            "body": "\n".join(lines),
+        }
+
+    def build_result_details(self, result: Any, **_: Any) -> dict[str, Any] | None:
+        parsed = _parse_command_result(str(result))
+        exit_code = parsed.get("exit_code")
+        output = parsed.get("output") or ""
+        if exit_code == 0:
+            return None
+        return {
+            "kind": "text",
+            "title": "Shell output",
+            "body": _tail(output) or "(no output)",
+        }
+
+    def needs_confirmation(self, **_: Any) -> bool:
+        return bool(self.config.get("confirm_commands", False))
 
     def forward(
         self,
@@ -659,25 +980,26 @@ class Shell(Tool):
         except subprocess.TimeoutExpired as exc:
             output = exc.output or ""
             output_str = output.decode("utf-8", errors="replace") if isinstance(output, bytes) else str(output)
-            msg = f"[TIMEOUT] Command exceeded {timeout_ms} ms\n{output_str}"
-            if notes:
-                msg = "\n".join(notes) + "\n" + msg
-            return truncate(msg, max_length=max_chars)
+            return _render_command_result(
+                command_display=command_display,
+                cwd=cwd,
+                returncode=124,
+                output=output_str,
+                max_chars=max_chars,
+                notes=notes,
+                timed_out=True,
+            )
         except Exception as exc:  # pragma: no cover - defensive guard
             return f"Error running command: {exc}"
 
-        output = result.stdout or ""
-        header = [
-            f"[cwd] {os.path.abspath(cwd)}",
-            f"[command] {command_display}",
-            f"[exit code] {result.returncode}",
-        ]
-        if result.returncode != 0:
-            header.append("[status] command failed (non-zero exit)")
-        if notes:
-            header = notes + header
-        rendered = "\n".join(header) + "\n" + output
-        return truncate(rendered, max_length=max_chars)
+        return _render_command_result(
+            command_display=command_display,
+            cwd=cwd,
+            returncode=result.returncode,
+            output=result.stdout or "",
+            max_chars=max_chars,
+            notes=notes,
+        )
 
 
 class Delete(Tool):
@@ -701,25 +1023,42 @@ class Delete(Tool):
     - Use with caution, as deletion is permanent and irreversible.
     - Can delete both files and directories recursively.
     - Will report an error if the file or directory doesn't exist.
-    - If CONFIRM_EDITS is enabled, will prompt for confirmation before deletion.
+    - If confirm_edits is enabled, the agent will request confirmation before deletion.
     """
     inputs = {"path": {"type": "string", "description": "Path to file or directory to delete."}}
     output_type = "string"
 
+    def describe_call(self, *, path: str, **_: Any) -> str:
+        return path
+
+    def build_preview(self, *, path: str, **_: Any) -> dict[str, Any] | None:
+        if not os.path.exists(path):
+            return None
+        if os.path.isfile(path):
+            item_type = "file"
+        elif os.path.isdir(path):
+            item_type = "directory"
+        else:
+            item_type = "path"
+        details = [f"Path: {os.path.abspath(path)}", f"Type: {item_type}"]
+        if os.path.isdir(path):
+            try:
+                details.append(f"Entries: {len(os.listdir(path))}")
+            except Exception:
+                pass
+        return {
+            "kind": "text",
+            "title": f"Delete {path}",
+            "body": "\n".join(details),
+        }
+
+    def needs_confirmation(self, **_: Any) -> bool:
+        return bool(self.config.get("confirm_edits", False))
+
     def forward(self, *, path: str) -> str:  # noqa: D401
         if not os.path.exists(path):
             return f"Error: The path '{path}' does not exist."
-        
-        item_type = "file" if os.path.isfile(path) else "directory with all contents" if os.path.isdir(path) else "unknown item"
-        
-        # Interactive confirmation (if enabled)
-        confirm_edits = self.config.get("confirm_edits", False)
-        if confirm_edits:
-            ans = input(f"Delete {item_type} at '{path}'? [y/N] ").strip().lower()
-            if ans != "y":
-                feedback = input("(Optional) feedback for the agent, or just press ↵ to skip: ")
-                return f"Deletion rejected by user. Feedback: {feedback or '<none>'}"
-            
+
         try:
             if os.path.isfile(path):
                 os.remove(path)
@@ -764,6 +1103,15 @@ class ListFiles(Tool):
         "max_entries": {"type": "integer", "description": "Maximum entries to return (optional).", "required": False},
     }
     output_type = "array"
+
+    def describe_call(self, *, path: str = ".", **_: Any) -> str:
+        return path
+
+    def describe_result(self, result: Any, *, path: str = ".", **_: Any) -> str:
+        if isinstance(result, str):
+            return result
+        count = max(0, len(result) - 1)
+        return f"Listed {count} entr{'y' if count == 1 else 'ies'} in {path}"
 
     def forward(
         self,
@@ -875,6 +1223,19 @@ class SearchFiles(Tool):
     }
     output_type = "string"
 
+    def describe_call(self, *, pattern: str, path: str = ".", **_: Any) -> str:
+        return f"{pattern!r} in {path}"
+
+    def describe_result(self, result: Any, **_: Any) -> str:
+        text = str(result)
+        first_line = text.splitlines()[0] if text else ""
+        if first_line.startswith("[rg] no matches"):
+            return first_line.replace("[rg] ", "").capitalize()
+        if first_line.startswith("[rg] "):
+            match_count = max(0, len(text.splitlines()) - 1)
+            return f"Found {match_count} match(es)"
+        return _clip(first_line or "Search completed")
+
     def forward(
         self,
         *,
@@ -967,6 +1328,20 @@ class ReadPDF_txtimg(Tool):
         "image_only": {"type": "boolean", "description": "If true, only returns page images without text", "required": False}
     }
     output_type = "object"
+
+    def describe_call(self, *, filename: str, page: int = None, **_: Any) -> str:
+        if page is None:
+            return filename
+        return f"{filename} page {page}"
+
+    def describe_result(self, result: Any, *, filename: str, **_: Any) -> str:
+        if isinstance(result, dict) and "error" in result:
+            return str(result["error"])
+        if isinstance(result, dict):
+            text_count = len(result.get("text", []))
+            img_count = len(result.get("images", []))
+            return f"Read PDF {filename}: {text_count} text block(s), {img_count} image(s)"
+        return super().describe_result(result, filename=filename)
 
     def forward(self, *, filename: str, page: int = None, image_only: bool = True) -> Dict[str, Any]:
         """
@@ -1087,6 +1462,17 @@ class ReadPDF_notxt(Tool):
         # "image_only": {"type": "boolean", "description": "If true, only returns page images without text"}
     }
     output_type = "object"
+
+    def describe_call(self, *, filename: str, **_: Any) -> str:
+        return filename
+
+    def describe_result(self, result: Any, *, filename: str, **_: Any) -> str:
+        if isinstance(result, dict) and "error" in result:
+            return str(result["error"])
+        if isinstance(result, dict):
+            img_count = len(result.get("images", []))
+            return f"Read PDF {filename}: {img_count} image(s)"
+        return super().describe_result(result, filename=filename)
 
     def forward(self, *, filename: str) -> Dict[str, Any]:
         """
@@ -1210,6 +1596,14 @@ class ViewImage(Tool):
     }
     output_type = "image"
 
+    def describe_call(self, *, filename: str, **_: Any) -> str:
+        return filename
+
+    def describe_result(self, result: Any, *, filename: str, **_: Any) -> str:
+        if isinstance(result, str) and result.startswith("data:image"):
+            return f"Loaded image {filename}"
+        return str(result)
+
     def forward(self, *, filename: str) -> str:  # noqa: D401
         if not os.path.isfile(filename):
             return f"File not found: {filename}"
@@ -1286,6 +1680,20 @@ class UpdatePlan(Tool):
     }
     output_type = "string"
 
+    def describe_call(self, **_: Any) -> str:
+        return "plan"
+
+    def build_result_details(self, result: Any, **_: Any) -> dict[str, Any] | None:
+        last_plan = getattr(self, "_last_plan", None)
+        if not last_plan:
+            return None
+        return {
+            "kind": "plan",
+            "title": "Plan",
+            "plan": last_plan.get("plan", []),
+            "explanation": last_plan.get("explanation"),
+        }
+
     def forward(self, *, plan: Any, explanation: Optional[str] = None) -> str:  # noqa: D401
         if isinstance(plan, str):
             try:
@@ -1349,6 +1757,9 @@ class MakePlan(Tool):
     inputs = {"content": {"type": "string", "description": "Plan body."}}
     output_type = "string"
 
+    def describe_call(self, **_: Any) -> str:
+        return "plan"
+
     def forward(self, *, content: str) -> str:  # noqa: D401
         idx = 0
         while True:
@@ -1386,6 +1797,9 @@ class Reflect(Tool):
     inputs = {"content": {"type": "string", "description": "Reflection content."}}
     output_type = "string"
 
+    def describe_call(self, **_: Any) -> str:
+        return "reflection"
+
     def forward(self, *, content: str) -> str:  # noqa: D401
         idx = 0
         while True:
@@ -1420,6 +1834,12 @@ class FinalAnswer(Tool):
     inputs = {"answer": {"type": "string", "description": "Answer text."}}
     output_type = "string"
 
+    def describe_call(self, **_: Any) -> str:
+        return "answer"
+
+    def describe_result(self, result: Any, **_: Any) -> str:
+        return "Final answer ready"
+
     def forward(self, *, answer: str) -> str:  # noqa: D401
         return answer
 
@@ -1445,6 +1865,12 @@ class GetUserInput(Tool):
     """
     inputs = {"message": {"type": "string", "description": "Prompt shown to the user."}}
     output_type = "string"
+
+    def describe_call(self, **_: Any) -> str:
+        return "prompt"
+
+    def describe_result(self, result: Any, **_: Any) -> str:
+        return f"User input received: {_clip(str(result), 60)}"
 
     def forward(self, *, message: str) -> str:  # noqa: D401
         return input(message + " ")
