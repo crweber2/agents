@@ -14,7 +14,7 @@ Usage:
     from agents import Agent, LLMClient
     
     # Create an LLM client
-    model = LLMClient(model_id="gpt-4.1")
+    model = LLMClient(model_id="gpt-5.4")
     
     # Create an agent with tools
     agent = Agent(
@@ -54,16 +54,16 @@ from typing import Any, Dict, List, Mapping, MutableSequence, Optional, Sequence
 # local ----------------------------------------------------------------------
 from agent_tools import (
     Tool, WriteFile, ReadFile, EditFile, RunPython, Shell, ViewImage,
-    ListFiles, SearchFiles, MakePlan, Reflect, FinalAnswer, GetUserInput,
+    ListFiles, SearchFiles, MakePlan, Reflect, Commentary, FinalAnswer, GetUserInput,
     UpdatePlan, ReadPDF, _RE_TRAILING_COMMA
 )
 
 # 3rd-party ------------------------------------------------------------------
-from rich.console import Console
+from rich.console import Console, Group
+from rich.live import Live
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.syntax import Syntax
-from rich.table import Table
 from rich.text import Text
 
 _console: Console | None = Console()
@@ -121,6 +121,8 @@ _LEXER_BY_EXT = {
     ".yml": "yaml",
 }
 
+_LIVE_DEPTH = 0
+
 
 def _clip(text: Any, max_length: int = 100) -> str:
     rendered = str(text).strip().replace("\n", " ")
@@ -157,6 +159,19 @@ def _syntax_lexer(path: str | None) -> str:
 def _render_final_answer_panel(answer: str, title: str = "Final Answer") -> None:
     body = Text(answer or "", style="white")
     _console_print(Panel(body, title=title, border_style="green", expand=True))
+
+
+def _format_elapsed(seconds: float | int | None) -> str:
+    if seconds is None:
+        return "0s"
+    total = max(0, int(seconds))
+    minutes, secs = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
 ###############################################################################
 # Chat message & memory classes
 ###############################################################################
@@ -332,18 +347,25 @@ class ConversationMemory(MutableSequence[ChatMessage]):
             if m.content  # Skip empty content
         )
         
-        # Ask model for summary
+        # Use a real user turn here because some local chat templates reject
+        # requests that contain only a system message.
+        summary_instruction = (
+            "You summarize conversations for agent handoff. "
+            "Be complete and factual, and preserve filenames, decisions, plans, "
+            "variable names, failed attempts, and directories in use."
+        )
         summary_prompt = (
             "Summarize the following conversation so another agent can "
-            "continue where we left off. Be absolutely complete in your summary, ensuring nothing is "
-            "forgotten. Preserve any filenames, decisions, plans or variable names that matter. "
-            "Included every everything you tried, even if it failed. Make sure to summarize all files that you wrote "
-            "or existing directories that you are using. \n\n" + combined
+            "continue where we left off. Be absolutely complete so nothing is "
+            "forgotten.\n\nConversation:\n" + combined
         )
-        
+
         # Get summary from model
         summary_msg = model.chat(
-            messages=[{"role": "system", "content": summary_prompt}],
+            messages=[
+                {"role": "system", "content": summary_instruction},
+                {"role": "user", "content": summary_prompt},
+            ],
             tools=None
         )
         summary = summary_msg.content.strip()
@@ -361,7 +383,7 @@ class LLMClient:
 
     def __init__(
         self,
-        model_id: str = "gpt-5.3-codex",
+        model_id: str = "gpt-5.4",
         temperature: float = 0.2,
         api_key: str | None = None,
         api_base: str | None = None,
@@ -458,63 +480,64 @@ class Agent:
         clear_memory_on_run: bool = False,
         include_function_thoughts: bool = True,
         system_message: str = textwrap.dedent('''
-            You are a highly skilled coding agent.  Your job is to complete the tasks assigned
-            to you using the provided tools. 
-                                              
-            Your thinking should be thorough and so it's fine if it's very long. You can think 
-            step by step before and after each action you decide to take.
-          
-            You MUST iterate and keep going until the problem is solved.
+            You are a precise coding agent working in a terminal workspace.
+            Complete the user's task using the available tools.
 
-            Only terminate your turn when you are sure that the problem 
-            is solved. Go through the problem step by step, and make sure 
-            to verify that your solution or changes are correct. 
-            NEVER end your turn without having solved the problem, 
-            and when you say you are going to make a tool call, make 
-            sure you ACTUALLY make the tool call, instead of ending your turn.
-                                                        
-            Take your time and think through every step - remember to check your 
-            solution rigorously. It is better to make incremental changes, test, and improve,
-            rather than start with a very compelx solution.
+            Core behavior:
+            - Keep going until the task is fully resolved or you are truly blocked.
+            - Do not guess about code, files, or results. Read, run, inspect, and verify.
+            - If you say you will take an action, take it with a tool call.
+            - Respect the existing codebase. Be surgical in established projects.
+            - Fix root causes when practical; avoid cosmetic or unrelated changes.
+            - Prefer simple, robust solutions over clever or sprawling ones.
 
-            You MUST plan extensively before each step, and 
-            reflect extensively on the outcomes of the previous function calls.
+            Planning:
+            - Use update_plan for non-trivial, ambiguous, or multi-step work.
+            - For any task likely to take more than a couple of meaningful actions, call update_plan early, usually within the first 1-3 tool calls.
+            - Skip update_plan for simple one-step tasks that can be completed immediately.
+            - Plans should be short, concrete, easy to verify, and free of padding.
+            - Prefer 3-6 action-oriented steps rather than vague or padded plans.
+            - Keep exactly one step in_progress until everything is done.
+            - Update the plan when a step starts, completes, stalls, or when the approach changes.
+            - If you finish a meaningful piece of work and have not updated the plan yet, update it before moving on.
+            - Before final_answer, make sure the plan accurately reflects what is complete and what remains.
+            - Do not repeat the full plan in prose after calling update_plan; the UI already shows it.
 
-            # Workflow
+            Execution:
+            - First understand the task, constraints, and completion criteria.
+            - Gather the minimum context needed before editing.
+            - Work incrementally: inspect, edit, run targeted checks, then refine.
+            - Prefer focused edits over rewriting entire files unless a rewrite is clearly cleaner.
+            - Do not create unnecessary versioned files like *_v2.py or *_final.py.
+            - Reuse existing project patterns, naming, and structure.
+            - Do not chase unrelated bugs, failing tests, or cleanup outside the task.
+            - Avoid re-reading files you just wrote or patched unless something external may have changed them or you need exact lines.
 
-            ## High-Level Problem Solving Strategy
+            Debugging:
+            - When behavior is wrong, identify the root cause before patching.
+            - Form a concrete hypothesis, test it, and use the result to choose the next step.
+            - Preserve useful observations from failures and use them to narrow the search.
+            - Revisit assumptions quickly when results do not match expectations.
 
-            1. Understand the problem deeply. Carefully read the issue and think critically about what is required. Restate the completion criteria.
-            2. Develop a clear, step-by-step plan. Break down the task into manageable, incremental sub-tasks and steps.
-            3. For each task, implement the solution incrementally. Make small, testable code changes.
-            4. Debug as needed. Use debugging techniques to isolate and resolve issues.
-            5. Test frequently. Run tests after each change to verify correctness.
-            6. After you belive you are finished with a tasks, restate the completion critera one-by-one and verify if each is complete.
+            Validation:
+            - Validate changed behavior whenever practical.
+            - Start with the most targeted check you can run, then broaden if needed.
+            - If the repo has tests or build commands relevant to the change, use them.
+            - If there is no test harness, do not invent a large one just for this task.
+            - For scientific, numerical, or plotting work, run the code and check whether outputs are physically or numerically plausible.
+            - Inspect generated images or reports when they matter to correctness.
+            - Operate headlessly; do not rely on interactive plot windows like matplotlib show().
+            - Do not claim to have run or verified anything you did not actually run or verify.
 
-            Refer to the detailed sections below for more information on each step.
+            Approvals and blockers:
+            - Some tool calls may require user approval. If a change is rejected, absorb the feedback and continue.
+            - If information is missing and cannot be inferred safely, ask only the minimum necessary question.
+            - If blocked by a hard constraint, explain it briefly and propose the best next action.
 
-            ## 1. Deeply Understand the Problem
-            Carefully read the issue and think hard about a plan to solve it before coding.
-
-            ## 2. Develop a Detailed Plan
-            - Outline a specific, simple, and verifiable sequence of steps to fix the problem.
-            - Break down the task into into small, incremental steps.
-            - For each tasks, identify completion critera
-
-            ## 3. Debugging
-            - Make code changes only if you have high confidence they can solve the problem
-            - When debugging, try to determine the root cause rather than addressing symptoms
-            - Debug for as long as needed to identify the root cause and identify a fix
-            - Use print statements, logs, or temporary code to inspect program state, including descriptive statements or error messages to understand what's happening
-            - Operate in a headless mode in python, so do not use "show()" in matplotlib
-            - To test hypotheses, you can also add test statements or functions
-            - Do no make new versions of files (eg *_v2.py, *_v2_final.py) unless necessary. Just edit the files.
-            - Revisit your assumptions if unexpected behavior occurs.
-
-            ## 4. Final Verification
-            - Confirm that all completion criteria are completed
-            - If applicable, view any image that are produced to make sure they look as expected
-            - Iterate until you are extremely confident the solution is complete and correct.
+            Final answer:
+            - Use final_answer only when the task is complete or you are genuinely blocked.
+            - Before final_answer, restate the completion criteria mentally and check them one by one.
+            - Final responses should be concise, concrete, and honest about verification and remaining caveats.
             '''),
     ) -> None:
         self.name = name
@@ -541,6 +564,15 @@ class Agent:
         self.clear_memory_on_run = clear_memory_on_run
         self.include_function_thoughts = include_function_thoughts
         self.auto_save = auto_save
+        self._current_plan: dict[str, Any] | None = None
+        self._pin_plan_in_footer: bool = False
+        self._run_started_at: float | None = None
+        self._latest_prompt_tokens: int | None = None
+        self._current_local_step: int = 0
+        self._status_message: str = "Idle"
+        self._live: Live | None = None
+        self._owns_live: bool = False
+        self._task_preview: str = ""
         
         # Add inputs/output_type for use as a tool (when this agent is called by another agent)
         self.inputs = {
@@ -566,39 +598,56 @@ class Agent:
         if should_reset:
             self.memory = ConversationMemory()
             self.memory.append(ChatMessage.system(self.system_prompt))
+            self._current_plan = None
         self.memory.append(ChatMessage.user(task))
         self._log("Task received", level=1)
-        if self.verbosity >= 1:
-            _console_print(Rule(f"{self.name} [{getattr(self.model, 'model_id', 'model')}]"))
-            self._render_event(_clip(task, 140), label="task", style="bright_black")
+        console = self._console_ref()
+        clip_width = max(40, (console.width if console is not None else 100) - 20)
+        self._task_preview = _clip(task, clip_width)
+        self._run_started_at = time.perf_counter()
+        self._latest_prompt_tokens = None
+        self._current_local_step = 0
+        self._status_message = "Thinking"
+        self._start_live_display()
+        try:
+            if self.verbosity >= 1:
+                self._ui_print(Rule(f"{self.name} [{getattr(self.model, 'model_id', 'model')}]"))
+                self._render_event(self._task_preview, label="task", style="bright_black")
+                self._refresh_live()
 
-        for local_step in range(1, self.max_steps + 1):
-            self._increment_master_step()
-            if self.planning_interval and (local_step == 1 or (local_step - 1) % self.planning_interval == 0):
-                # plan_prompt = ("Draft a plan for {{ task }}" if local_step == 1 else "Plan update - {{ remaining_steps }} steps left.")
-                # self.memory.append(ChatMessage.user(self._populate(plan_prompt, task=task, remaining_steps=self.max_steps - local_step)))
-                # _ = self._take_action()
-                answer = self._take_action(specific_tools=['update_plan'])
-            else:
-                answer = self._take_action()
-            
-            # Write memory trace to file independently of console verbosity
-            if self.trace_enabled:
-                self._dump_trace()
-            
-            # Auto-summarize memory if it exceeds threshold
-            if self.memory_threshold and len(self.memory) > self.memory_threshold:
-                self._log(f"Memory threshold reached ({len(self.memory)} > {self.memory_threshold}), summarizing...", 2)
-                self.memory.summarize(self.model)
-                self._log(f"Memory summarized to {len(self.memory)} messages", 2)
+            for local_step in range(1, self.max_steps + 1):
+                self._increment_master_step()
+                self._current_local_step = local_step
+                self._status_message = "Thinking"
+                self._refresh_live()
+                if self.planning_interval and (local_step == 1 or (local_step - 1) % self.planning_interval == 0):
+                    answer = self._take_action(specific_tools=['update_plan'])
+                else:
+                    answer = self._take_action()
                 
-            if answer is not None:
-                self._log("Final answer produced", 1)
-                return answer
-        # ------------- exhausted budget - force summary ------------------
-        self._log("Step budget exhausted - forcing summary", 1)
-        summary = self._summarize_for_final()
-        return summary
+                # Write memory trace to file independently of console verbosity
+                if self.trace_enabled:
+                    self._dump_trace()
+                
+                # Auto-summarize memory if it exceeds threshold
+                if self.memory_threshold and len(self.memory) > self.memory_threshold:
+                    self._log(f"Memory threshold reached ({len(self.memory)} > {self.memory_threshold}), summarizing...", 2)
+                    self.memory.summarize(self.model)
+                    self._log(f"Memory summarized to {len(self.memory)} messages", 2)
+                    
+                if answer is not None:
+                    self._log("Final answer produced", 1)
+                    self._status_message = "Final answer ready"
+                    self._refresh_live()
+                    return answer
+            # ------------- exhausted budget - force summary ------------------
+            self._log("Step budget exhausted - forcing summary", 1)
+            self._status_message = "Summarizing"
+            self._refresh_live()
+            summary = self._summarize_for_final()
+            return summary
+        finally:
+            self._stop_live_display()
 
     # Let an Agent instance behave like a tool ------------------------------
     def __call__(self, *, task: str, reset: bool = None) -> str:  # noqa: D401
@@ -619,6 +668,124 @@ class Agent:
     def _label_text(self, label: str, style: str = "bold bright_black") -> Text:
         return Text(label, style=style)
 
+    def _console_ref(self) -> Console | None:
+        if self._live is not None:
+            return self._live.console
+        return _console
+
+    def _ui_print(self, renderable: Any = "", *, style: str | None = None) -> None:
+        console = self._console_ref()
+        if console is not None:
+            if isinstance(renderable, str) and style:
+                console.print(Text(renderable, style=style))
+            else:
+                console.print(renderable)
+            return
+        if isinstance(renderable, Text):
+            print(renderable.plain)
+        else:
+            print(renderable)
+
+    def _ui_input(self, prompt: str) -> str:
+        console = self._console_ref()
+        if console is not None:
+            return console.input(prompt)
+        return input(prompt)
+
+    def _build_plan_renderable(self) -> Panel | None:
+        if not self._current_plan:
+            return None
+        explanation = str(self._current_plan.get("explanation") or "").strip()
+        plan_items = self._current_plan.get("plan", []) or []
+        body = Text()
+        if explanation:
+            body.append(explanation, style="bright_black")
+            if plan_items:
+                body.append("\n")
+        markers = {
+            "completed": ("[x] ", "green"),
+            "in_progress": ("[>] ", "bold cyan"),
+            "pending": ("[ ] ", "white"),
+        }
+        for idx, item in enumerate(plan_items):
+            if idx:
+                body.append("\n")
+            status = str(item.get("status", "pending"))
+            step = str(item.get("step", "")).strip()
+            marker, style = markers.get(status, ("[ ] ", "white"))
+            body.append(marker, style=style)
+            body.append(step, style=style)
+        if not body:
+            body.append("No plan items yet.", style="bright_black")
+        return Panel(body, title="Updated Plan", border_style="cyan", expand=True)
+
+    def _build_status_renderable(self) -> Group:
+        elapsed = _format_elapsed(
+            None if self._run_started_at is None else time.perf_counter() - self._run_started_at
+        )
+        model_id = str(getattr(self.model, "model_id", "model"))
+        token_text = (
+            f"{self._latest_prompt_tokens:,} tok"
+            if self._latest_prompt_tokens is not None
+            else "-- tok"
+        )
+        cwd_text = os.getcwd()
+        home = os.path.expanduser("~")
+        if cwd_text.startswith(home):
+            cwd_text = "~" + cwd_text[len(home):]
+        step_text = f"step {self._current_local_step}/{self.max_steps}" if self._current_local_step else "step 0"
+        status_text = Text(_clip(self._status_message or "Working", 72), style="bold white")
+        meta = Text()
+        meta.append(model_id, style="bold bright_white")
+        meta.append(" • ", style="bright_black")
+        meta.append(token_text, style="cyan")
+        meta.append(" • ", style="bright_black")
+        meta.append(step_text, style="bright_black")
+        meta.append(" • ", style="bright_black")
+        meta.append(elapsed, style="bright_black")
+        meta.append(" • ", style="bright_black")
+        meta.append(_clip(cwd_text, 72), style="bright_black")
+        return Group(status_text, meta)
+
+    def _build_live_renderable(self) -> Group:
+        parts: list[Any] = []
+        plan_panel = self._build_plan_renderable()
+        if self._pin_plan_in_footer and plan_panel is not None:
+            parts.append(plan_panel)
+        parts.append(self._build_status_renderable())
+        return Group(*parts)
+
+    def _refresh_live(self) -> None:
+        if self._live is not None:
+            self._live.update(self._build_live_renderable(), refresh=True)
+
+    def _start_live_display(self) -> None:
+        global _LIVE_DEPTH
+        if self.verbosity < 1 or _console is None or _LIVE_DEPTH > 0:
+            self._live = None
+            self._owns_live = False
+            return
+        self._live = Live(
+            self._build_live_renderable(),
+            console=_console,
+            refresh_per_second=8,
+            transient=False,
+            vertical_overflow="visible",
+        )
+        self._live.start()
+        self._owns_live = True
+        _LIVE_DEPTH += 1
+
+    def _stop_live_display(self) -> None:
+        global _LIVE_DEPTH
+        if self._live is not None and self._owns_live:
+            self._live.stop()
+            _LIVE_DEPTH = max(0, _LIVE_DEPTH - 1)
+            if _console is not None:
+                _console.print()
+        self._live = None
+        self._owns_live = False
+
     def _render_event(
         self,
         message: str,
@@ -634,7 +801,8 @@ class Agent:
         prefix_width = max(16, len(default_prefix) + 2)
         prefix_block = f"{prefix:<{prefix_width}}" if prefix else " " * prefix_width
         wrapped_lines: list[str] = []
-        wrap_width = max(20, ((_console.width if _console is not None else 100) - prefix_width))
+        console = self._console_ref()
+        wrap_width = max(20, ((console.width if console is not None else 100) - prefix_width))
         for raw_line in str(message).splitlines() or [""]:
             pieces = textwrap.wrap(
                 raw_line,
@@ -643,7 +811,7 @@ class Agent:
                 drop_whitespace=False,
             )
             wrapped_lines.extend(pieces or [""])
-        if _console is None:
+        if console is None:
             lines = [
                 (prefix_block if idx == 0 else " " * prefix_width) + line
                 for idx, line in enumerate(wrapped_lines or [""])
@@ -656,7 +824,7 @@ class Agent:
             rendered.append(line, style=style)
             if idx < len(wrapped_lines) - 1:
                 rendered.append("\n")
-        _console.print(rendered, soft_wrap=True)
+        console.print(rendered, soft_wrap=True)
 
     def _render_detail(self, detail: Mapping[str, Any] | None, *, force: bool = False) -> None:
         if not detail:
@@ -679,26 +847,14 @@ class Agent:
             rendered = json.dumps(detail.get("data", {}), indent=2, ensure_ascii=False)
             renderable = Syntax(rendered, "json", theme="ansi_dark", word_wrap=True)
         elif kind == "plan":
-            table = Table.grid(expand=True, padding=(0, 1))
-            table.add_column(width=12, no_wrap=True)
-            table.add_column(ratio=1)
-            explanation = detail.get("explanation")
-            if explanation:
-                table.add_row(Text("explanation", style="bold cyan"), Text(str(explanation), style="white"))
-            for item in detail.get("plan", []):
-                status = str(item.get("status", "pending"))
-                step = str(item.get("step", ""))
-                status_style = {
-                    "completed": "green",
-                    "in_progress": "yellow",
-                    "pending": "bright_black",
-                }.get(status, "white")
-                table.add_row(Text(status, style=f"bold {status_style}"), Text(step, style="white"))
-            renderable = table
+            renderable = self._build_plan_renderable() or Text(str(detail.get("body", "")), style="white")
         else:
             renderable = Text(str(detail.get("body", "")), style="white")
 
-        _console_print(Panel(renderable, title=title, border_style=border_style, expand=True))
+        if isinstance(renderable, Panel):
+            self._ui_print(renderable)
+        else:
+            self._ui_print(Panel(renderable, title=title, border_style=border_style, expand=True))
 
     def _render_assistant_message(self, assistant_msg: ChatMessage) -> None:
         content = (assistant_msg.content or "").strip()
@@ -721,18 +877,29 @@ class Agent:
             self._render_event(_clip(content, 120), style="white")
 
     def _render_usage(self, assistant_msg: ChatMessage) -> None:
-        if self.verbosity < 2 or not getattr(assistant_msg, "usage", None):
+        if not getattr(assistant_msg, "usage", None):
             return
-        tokens_used = getattr(assistant_msg.usage, "total_tokens", None)
-        if tokens_used is not None:
-            self._render_event(f"Tokens used: {tokens_used}", level=2, label="", style="bright_black")
+        prompt_tokens = getattr(assistant_msg.usage, "prompt_tokens", None)
+        if prompt_tokens is not None:
+            try:
+                self._latest_prompt_tokens = int(prompt_tokens)
+            except Exception:
+                self._latest_prompt_tokens = None
+            self._refresh_live()
+        if self.verbosity < 2:
+            return
+        total_tokens = getattr(assistant_msg.usage, "total_tokens", None)
+        if prompt_tokens is not None:
+            self._render_event(f"Prompt tokens: {prompt_tokens}", level=2, label="", style="bright_black")
+        if total_tokens is not None:
+            self._render_event(f"Total tokens: {total_tokens}", level=2, label="", style="bright_black")
 
     def _prompt_for_approval(self, tool: Tool, args: dict[str, Any], preview: Mapping[str, Any] | None) -> tuple[bool, str | None]:
         if preview:
             self._render_detail(preview, force=True)
         prompt = f"Approve {tool.name}: {tool.describe_call(**args)}? [y/N/m or feedback] "
         while True:
-            response = _console_input(prompt).strip()
+            response = self._ui_input(prompt).strip()
             lowered = response.lower()
             if lowered == "y":
                 return True, None
@@ -748,7 +915,7 @@ class Agent:
                 )
                 continue
             if lowered in {"", "n"}:
-                feedback = _console_input("Feedback (optional): ").strip()
+                feedback = self._ui_input("Feedback (optional): ").strip()
                 return False, feedback or None
             return False, response
 
@@ -867,8 +1034,19 @@ class Agent:
         # lines = [base, "", "Here are your tools:"]
         
         # Pre‑prepend the three reminders so they are always first
-        # base_with_reminders = REMINDERS + "\n" + base
-        base_with_reminders = base
+        shared_tool_guidance = textwrap.dedent(
+            """
+            Tool-use guidance:
+            - Before a meaningful cluster of tool calls, use the commentary tool to briefly explain what you are about to do.
+            - Use commentary to connect progress across steps, especially after learning something important, changing approach, or beginning implementation/verification.
+            - Keep commentary to 1-2 sentences, grounded in recent progress, and focused on the immediate next actions.
+            - Skip commentary for isolated trivial reads.
+            - Avoid long silent stretches of tool calls; after several meaningful actions, add another concise commentary update.
+            - Do not use commentary or update_plan as a substitute for making progress; after narrating or planning, do the work.
+            """
+        ).strip()
+
+        base_with_reminders = base.strip() + "\n\n" + shared_tool_guidance
 
 
         if not add_tools:
@@ -907,6 +1085,8 @@ class Agent:
             tools = [self._tool_to_openai(t) for t in self.tools.values()]
         else:
             tools = [self._tool_to_openai(t) for t in self.tools.values() if t.name in specific_tools]
+        self._status_message = "Thinking"
+        self._refresh_live()
         msg = self.model.chat(messages=self.memory.to_openai(), tools=tools)
         response_content = msg.content
         # tool_calls = getattr(msg, "tool_calls", None)
@@ -974,7 +1154,12 @@ class Agent:
                 call_summary = name
             call_display = f"{name}: {call_summary}"
             self._append_to_summary(call_display)
-            self._render_event(call_display, style="cyan")
+            self._status_message = call_display
+            self._refresh_live()
+            if name == "commentary":
+                self._render_event(call_summary, label="commentary", style="white")
+            else:
+                self._render_event(call_display, style="cyan")
 
             preview: Mapping[str, Any] | None = None
             preview_shown = False
@@ -996,6 +1181,8 @@ class Agent:
             approved = True
             rejection_feedback: str | None = None
             if requires_confirmation:
+                self._status_message = f"Awaiting approval: {name}"
+                self._refresh_live()
                 approved, rejection_feedback = self._prompt_for_approval(target, args, preview)
                 preview_shown = preview is not None
 
@@ -1071,6 +1258,14 @@ class Agent:
                 
             if name == "final_answer":
                 final_answer = args.get("answer", str(result))
+            elif name == "update_plan":
+                last_plan = getattr(target, "_last_plan", None)
+                if last_plan:
+                    self._current_plan = {
+                        "explanation": last_plan.get("explanation"),
+                        "plan": list(last_plan.get("plan", [])),
+                    }
+                    self._refresh_live()
 
             try:
                 result_summary = target.describe_result(result, **args)
@@ -1078,7 +1273,7 @@ class Agent:
                 lines = str(result).splitlines()
                 result_summary = _clip(lines[0] if lines else str(result), 120)
 
-            if elapsed_ms:
+            if elapsed_ms and result_summary:
                 result_summary = f"{result_summary} ({elapsed_ms} ms)"
             lowered_summary = result_summary.lower()
             if "rejected by user" in lowered_summary:
@@ -1094,7 +1289,8 @@ class Agent:
                 result_style = "red"
             else:
                 result_style = "green"
-            self._render_event(result_summary, label="", style=result_style)
+            if result_summary:
+                self._render_event(result_summary, label="", style=result_style)
 
             if preview and not preview_shown and self.verbosity >= 2 and preview.get("kind") in {"diff", "code"}:
                 self._render_detail(preview)
@@ -1108,7 +1304,18 @@ class Agent:
                     "body": str(exc),
                     "border_style": "red",
                 }
-            self._render_detail(result_detail)
+            if (
+                name == "update_plan"
+                and result_detail
+                and self.verbosity >= 1
+                and not self._pin_plan_in_footer
+            ):
+                self._render_detail(result_detail, force=True)
+            else:
+                self._render_detail(result_detail)
+            if name != "commentary":
+                self._status_message = result_summary or f"{name} complete"
+                self._refresh_live()
 
         # Feed images back to the model so it can "see" them
         if image_parts:
@@ -1266,6 +1473,7 @@ class Agent:
             "global_step": self._global_step,
             "cwd": os.getcwd(),
             "trace_dir": getattr(self, "_trace_dir", None),
+            "current_plan": self._current_plan,
         }
 
     def save_session(self, path = None) -> None:  # noqa: D401
@@ -1313,6 +1521,7 @@ class Agent:
         td = session.get("trace_dir")
         if td:
             inst._trace_dir = td
+        inst._current_plan = session.get("current_plan")
         return inst
 
 ###############################################################################
@@ -1344,7 +1553,7 @@ def main() -> None:  # noqa: D401
                         help="Use a local LLM instead of the OpenAI API for the executor agent")
     parser.add_argument("-v", "--verbosity", type=int, default=2, choices=range(0,4),
                         help="Verbosity level: 0-quiet 1-timeline 2-details 3-verbose (default 2)")
-    parser.add_argument("-m", "--model", default="gpt-4.1", help="OpenAI model")
+    parser.add_argument("-m", "--model", default="gpt-5.4", help="OpenAI model")
     parser.add_argument("-w", "--wkdir", action="store_true", help="move to work dir")
     parser.add_argument("--cp", default="", help="Copy file or directory to wkdir")
     parser.add_argument("-c", "--confirm-edits", action="store_true", 
@@ -1443,7 +1652,7 @@ def main() -> None:  # noqa: D401
     # ]
     tools_all = [
         WriteFile(confirm_edits=args.confirm_edits), ReadFile(), SearchFiles(), EditFile(confirm_edits=args.confirm_edits), #EditFile_patch(),# , RunPython(),
-        Shell(confirm_commands=args.confirm_shell), UpdatePlan(), ListFiles(), FinalAnswer()
+        Shell(confirm_commands=args.confirm_shell), Commentary(), UpdatePlan(), ListFiles(), FinalAnswer()
     ]
 
     if not args.multi:
@@ -1514,7 +1723,7 @@ def main() -> None:  # noqa: D401
             and report the results to the user.''')
 
         tools_manager = [
-            ListFiles(), SearchFiles(), MakePlan(),Reflect(), ReadFile(), RunPython(), Shell(confirm_commands=args.confirm_shell), FinalAnswer()
+            ListFiles(), SearchFiles(), MakePlan(), Reflect(), Commentary(), ReadFile(), RunPython(), Shell(confirm_commands=args.confirm_shell), FinalAnswer()
         ]
         if args.vision:
             tools_manager.insert(-1,ReadPDF())

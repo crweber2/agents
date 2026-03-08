@@ -12,5 +12,5 @@ from agents import Agent, LLMClient
 # Import tools from agent_tools.py
 from agent_tools import (
     Tool, WriteFile, ReadFile, EditFile, Delete, RunPython,
-    RunBash, ViewImage, ListFiles, MakePlan, FinalAnswer, GetUserInput
+    RunBash, ViewImage, ListFiles, MakePlan, Commentary, FinalAnswer, GetUserInput
 )

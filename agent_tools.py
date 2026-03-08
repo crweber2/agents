@@ -127,6 +127,16 @@ def _stringify_command(command: Union[str, list[str]]) -> str:
     return " ".join(command)
 
 
+def _build_subprocess_env(overrides: Optional[dict[str, Any]] = None) -> dict[str, str]:
+    """Build a subprocess environment with headless plotting defaults."""
+    env_map = os.environ.copy()
+    # Prevent matplotlib from selecting an interactive backend that opens windows.
+    env_map["MPLBACKEND"] = "Agg"
+    if overrides:
+        env_map.update({key: str(value) for key, value in overrides.items()})
+    return env_map
+
+
 def _render_command_result(
     *,
     command_display: str,
@@ -647,6 +657,7 @@ class RunPython(Tool):
 
     Special notes:
     - Uses the same Python interpreter as the host process.
+    - Forces `matplotlib` to use the non-interactive `Agg` backend.
     - Output is captured and returned as a single result, truncated to the first 20 kB.
     - If execution exceeds max_time, the process is terminated with a timeout message.
     - Command-line arguments are passed as-is to the script.
@@ -702,6 +713,7 @@ class RunPython(Tool):
             result = subprocess.run(
                 cmd,
                 cwd=cwd,
+                env=_build_subprocess_env(),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -750,6 +762,7 @@ class RunBash(Tool):
 
     Special notes:
     - Executes with *shell=True* (/bin/bash -c on Unix).
+    - Forces `matplotlib` to use the non-interactive `Agg` backend.
     - Use absolute paths or prefix with `cd … &&` for other directories.
     - Output is captured and truncated to 20 kB in the return value.
     """
@@ -785,6 +798,7 @@ class RunBash(Tool):
             result = subprocess.run(
                 command,
                 shell=True,
+                env=_build_subprocess_env(),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -831,6 +845,7 @@ class Shell(Tool):
 
     Special notes:
     - This tool does not implement OS-level sandboxing.
+    - Forces `matplotlib` to use the non-interactive `Agg` backend by default.
     - Output is truncated to 20 kB in the return value.
     """
     inputs = {
@@ -952,10 +967,9 @@ class Shell(Tool):
             bad_env = [k for k, v in env.items() if not isinstance(k, str) or not isinstance(v, (str, int, float, bool))]
             if bad_env:
                 return "Invalid env: keys must be strings and values must be str/number/bool."
-            env_map = os.environ.copy()
-            env_map.update({k: str(v) for k, v in env.items()})
+            env_map = _build_subprocess_env(env)
         else:
-            env_map = None
+            env_map = _build_subprocess_env()
 
         cwd = workdir or "."
         timeout_sec = None if timeout_ms is None else timeout_ms / 1000.0
@@ -1681,7 +1695,22 @@ class UpdatePlan(Tool):
     output_type = "string"
 
     def describe_call(self, **_: Any) -> str:
-        return "plan"
+        return "task tracker"
+
+    def describe_result(self, result: Any, **_: Any) -> str:
+        last_plan = getattr(self, "_last_plan", None)
+        if not last_plan:
+            return str(result)
+        counts = {"completed": 0, "in_progress": 0, "pending": 0}
+        for item in last_plan.get("plan", []):
+            status = str(item.get("status", "pending"))
+            counts[status] = counts.get(status, 0) + 1
+        return (
+            "Plan updated "
+            f"({counts.get('completed', 0)} done, "
+            f"{counts.get('in_progress', 0)} active, "
+            f"{counts.get('pending', 0)} pending)"
+        )
 
     def build_result_details(self, result: Any, **_: Any) -> dict[str, Any] | None:
         last_plan = getattr(self, "_last_plan", None)
@@ -1810,6 +1839,34 @@ class Reflect(Tool):
         with open(fname, "w", encoding="utf-8") as fp:
             fp.write(content)
         return f"Reflection saved → {fname}"
+
+
+class Commentary(Tool):
+    name = "commentary"
+    description = """Share a brief user-facing preamble before grouped tool calls.
+
+    When to use:
+    - Before a meaningful cluster of tool calls to explain the next action.
+    - To connect what has been learned so far with the immediate next step.
+
+    Parameters:
+    - content [string] REQUIRED - one or two sentences explaining the next action.
+
+    Special notes:
+    - Keep it concise and focused on the immediate next steps.
+    - Skip it for isolated trivial reads unless they are part of a larger action.
+    """
+    inputs = {"content": {"type": "string", "description": "Short user-facing preamble."}}
+    output_type = "string"
+
+    def describe_call(self, *, content: str, **_: Any) -> str:
+        return content.strip()
+
+    def describe_result(self, result: Any, **_: Any) -> str:
+        return ""
+
+    def forward(self, *, content: str) -> str:  # noqa: D401
+        return content.strip()
 
 
 class FinalAnswer(Tool):
