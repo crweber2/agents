@@ -1,42 +1,7 @@
-"""
-Autonomous Coding Agent Module.
-
-This module provides a flexible Agent class for creating autonomous coding agents that
-can interact with the OpenAI Chat API to perform tasks using tool-calling capabilities.
-
-Key components:
-- Agent: The main class for creating autonomous coding agents
-- LLMClient: A thin wrapper around the OpenAI Chat Completions API
-- ChatMessage: A lightweight wrapper for chat messages
-- ConversationMemory: Manages conversation history with optional summarization
-
-Usage:
-    from agents import Agent, LLMClient
-    
-    # Create an LLM client
-    model = LLMClient(model_id="gpt-5.4")
-    
-    # Create an agent with tools
-    agent = Agent(
-        tools=[WriteFile(), ReadFile(), ...],
-        model=model,
-        name="my_agent",
-        max_steps=20
-    )
-    
-    # Run the agent on a task
-    result = agent.run("Create a simple Python web server")
-
-Author: Chris Weber, crweber@gmail.com
-"""
+"""Autonomous coding agents with tool use, memory, and a CLI entrypoint."""
 
 from __future__ import annotations
 
-###############################################################################
-# Imports
-###############################################################################
-
-# stdlib ---------------------------------------------------------------------
 import argparse
 import datetime as _dt
 import json
@@ -49,16 +14,14 @@ import time
 import traceback
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, MutableSequence, Optional, Sequence, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
-# local ----------------------------------------------------------------------
 from agent_tools import (
     Tool, WriteFile, ReadFile, EditFile, RunPython, Shell, ViewImage,
     ListFiles, SearchFiles, MakePlan, Reflect, Commentary, FinalAnswer, GetUserInput,
-    UpdatePlan, ReadPDF, _RE_TRAILING_COMMA
+    UpdatePlan, ReadPDF, _RE_TRAILING_COMMA, _parse_command_result
 )
 
-# 3rd-party ------------------------------------------------------------------
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
@@ -70,28 +33,8 @@ _console: Console | None = Console()
 
 from openai import OpenAI
 
-###############################################################################
-# Helpers & constants
-###############################################################################
-
 LOGGER = logging.getLogger("agent")
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(name)s ▸ %(message)s")
-
-REMINDERS = textwrap.dedent(
-    """\
-    You are an agent - please keep going until the user’s query is completely resolved, 
-    before ending your turn and yielding back to the user. Only terminate your turn when 
-    you are sure that the problem is solved.
-
-    If you are not sure about file content or codebase structure pertaining to the user’s 
-    request, use your tools to read files and gather the relevant information: do NOT 
-    guess or make up an answer.
-
-    You MUST plan extensively before each function call, and reflect extensively on the 
-    outcomes of the previous function calls. DO NOT do this entire process by making 
-    function calls only, as this can impair your ability to solve the problem and think insightfully.
-    """
-)
 
 _LEXER_BY_EXT = {
     ".bash": "bash",
@@ -131,18 +74,25 @@ def _clip(text: Any, max_length: int = 100) -> str:
     return rendered[: max_length - 3] + "..."
 
 
-def _console_input(prompt: str) -> str:
-    if _console is not None:
-        return _console.input(prompt)
+def _console_input(prompt: str, console: Console | None = None) -> str:
+    console = _console if console is None else console
+    if console is not None:
+        return console.input(prompt)
     return input(prompt)
 
 
-def _console_print(renderable: Any = "", *, style: str | None = None) -> None:
-    if _console is not None:
+def _console_print(
+    renderable: Any = "",
+    *,
+    style: str | None = None,
+    console: Console | None = None,
+) -> None:
+    console = _console if console is None else console
+    if console is not None:
         if isinstance(renderable, str) and style:
-            _console.print(Text(renderable, style=style))
+            console.print(Text(renderable, style=style))
         else:
-            _console.print(renderable)
+            console.print(renderable)
         return
     if isinstance(renderable, Text):
         print(renderable.plain)
@@ -172,12 +122,6 @@ def _format_elapsed(seconds: float | int | None) -> str:
     if minutes:
         return f"{minutes}m {secs}s"
     return f"{secs}s"
-###############################################################################
-# Chat message & memory classes
-###############################################################################
-
-# near the top of agent.py (after imports)
-
 def _normalise_tool_calls(raw):
     """
     Return a list of JSON-serialisable dicts regardless of whether *raw*
@@ -202,19 +146,13 @@ def _normalise_tool_calls(raw):
 
 @dataclass
 class ChatMessage:
-    """Lightweight wrapper around a single chat message."""
-
     role: str
     content: str | None = None
-    # tool call fields --------------------------------------------------------
     name: str | None = None
     tool_call_id: str | None = None
-    tool_calls: Any | None = None  # populated for assistant messages
-    usage: Any | None = None  # stores token usage information
+    tool_calls: Any | None = None
+    usage: Any | None = None
 
-    # ---------------------------------------------------------------------
-    # Factory helpers
-    # ---------------------------------------------------------------------
     @classmethod
     def system(cls, content: str) -> "ChatMessage":  # noqa: D401
         return cls("system", content)
@@ -231,9 +169,6 @@ class ChatMessage:
     def tool(cls, *, name: str, tool_call_id: str, result: str) -> "ChatMessage":  # noqa: D401
         return cls("tool", result, name=name, tool_call_id=tool_call_id)
 
-    # ------------------------------------------------------------------
-    # Serialisation helpers
-    # ------------------------------------------------------------------
     def to_openai(self) -> Dict[str, Any]:  # noqa: D401
         msg: Dict[str, Any] = {"role": self.role}
         if self.name:
@@ -247,9 +182,6 @@ class ChatMessage:
                 msg["tool_calls"] = self.tool_calls
         return msg
 
-    # ------------------------------------------------------------------
-    # Session serialisation helpers
-    # ------------------------------------------------------------------
     def to_session(self) -> Dict[str, Any]:
         return {
             "role": self.role,
@@ -278,77 +210,44 @@ class ChatMessage:
         return cls(role or "user", content)
 
 
-class ConversationMemory(MutableSequence[ChatMessage]):
+class ConversationMemory:
     """Conversation history with optional automatic summarisation."""
 
     def __init__(self) -> None:
         self._messages: list[ChatMessage] = []
 
-    # MutableSequence interface ---------------------------------------------
-    def __getitem__(self, idx: int) -> ChatMessage:  # noqa: D401
-        return self._messages[idx]
-
-    def __setitem__(self, idx: int, value: ChatMessage) -> None:  # noqa: D401
-        self._messages[idx] = value
-
-    def __delitem__(self, idx: int) -> None:  # noqa: D401
-        del self._messages[idx]
+    def __iter__(self):
+        return iter(self._messages)
 
     def __len__(self) -> int:  # noqa: D401
         return len(self._messages)
 
-    def insert(self, idx: int, value: ChatMessage) -> None:  # noqa: D401
-        self._messages.insert(idx, value)
+    def append(self, value: ChatMessage) -> None:
+        self._messages.append(value)
 
-    # Convenience ------------------------------------------------------------
     def to_openai(self) -> List[Dict[str, Any]]:  # noqa: D401
         return [m.to_openai() for m in self._messages]
-        
-    # Memory summarization -------------------------------------------------
-    def summarize(self, model: Any, tail_len = 0) -> None:
-        """
-        Summarize the middle of the conversation when it grows too large.
-        
-        Keeps:
-        - first 2 messages (system + first user)
-        - optional plan at index 2 
-        - last 4 messages for local context
-        
-        Then inserts an assistant-authored summary in the middle.
-        """
-        if len(self._messages) <= 6:  # Not enough to summarize
+
+    def summarize(self, model: Any, tail_len: int = 0) -> None:
+        if len(self._messages) <= 6:
             return
-            
-        # Keep head (system + first user + optional plan)
+
         head = list(self._messages[:2])
-        # if len(self._messages) > 2 and self._messages[2].role == "assistant":
-        #     head.append(self._messages[2])  # keep initial plan
-            
-        # Keep tail (default: last 4 messages)
-        tail = []
-        if tail_len>0:
+        tail: list[ChatMessage] = []
+        if tail_len > 0:
             tail = list(self._messages[-tail_len:])
-            
-            # Skip leading tool responses in tail
             while tail and tail[0].role == "tool":
                 tail.pop(0)
                 if len(tail) < 2 and len(self._messages) > len(head) + 2:
-                    # Grab more from the original to ensure we have at least a couple messages
                     tail.insert(0, self._messages[-(tail_len + 1)])
-                
-        # Build body text to summarize
         body_msgs = self._messages[len(head):-len(tail)] if tail else self._messages[len(head):]
         if not body_msgs:
-            return  # Nothing to summarize
-            
+            return
         combined = "\n\n".join(
             f"{m.role}: {m.content or ''}"
             for m in body_msgs
-            if m.content  # Skip empty content
+            if m.content
         )
-        
-        # Use a real user turn here because some local chat templates reject
-        # requests that contain only a system message.
         summary_instruction = (
             "You summarize conversations for agent handoff. "
             "Be complete and factual, and preserve filenames, decisions, plans, "
@@ -359,8 +258,6 @@ class ConversationMemory(MutableSequence[ChatMessage]):
             "continue where we left off. Be absolutely complete so nothing is "
             "forgotten.\n\nConversation:\n" + combined
         )
-
-        # Get summary from model
         summary_msg = model.chat(
             messages=[
                 {"role": "system", "content": summary_instruction},
@@ -368,10 +265,22 @@ class ConversationMemory(MutableSequence[ChatMessage]):
             ],
             tools=None
         )
-        summary = summary_msg.content.strip()
-        
-        # Replace memory with head + summary + tail
-        self._messages = head + [ChatMessage.assistant(summary)] + tail
+        summary = textwrap.dedent(
+            f"""\
+            Below is a summary of the previous conversation and work completed so far.
+            Use it as context and continue from this state instead of restarting the task.
+
+            ######
+            {summary_msg.content.strip()}
+            ######
+
+            Remember:
+            - Continue after the latest user instruction.
+            - When taking actions, use tool calls instead of only describing the tool you want to use.
+            - If the task is complete, call `final_answer` instead of only saying that you are finished.
+            """
+        ).strip()
+        self._messages = head + [ChatMessage.user(summary)] + tail
 
 ###############################################################################
 # OpenAI wrapper
@@ -487,9 +396,12 @@ class Agent:
             - Keep going until the task is fully resolved or you are truly blocked.
             - Do not guess about code, files, or results. Read, run, inspect, and verify.
             - If you say you will take an action, take it with a tool call.
+            - If you decide a tool call is needed, actually make the tool call instead of only describing it.
             - Respect the existing codebase. Be surgical in established projects.
             - Fix root causes when practical; avoid cosmetic or unrelated changes.
             - Prefer simple, robust solutions over clever or sprawling ones.
+            - Work step by step and do not end your turn until you are sure the task is solved or you are genuinely blocked.
+            - Take your time to reason carefully, but keep making progress toward a verified solution.
 
             Planning:
             - Use update_plan for non-trivial, ambiguous, or multi-step work.
@@ -502,6 +414,7 @@ class Agent:
             - If you finish a meaningful piece of work and have not updated the plan yet, update it before moving on.
             - Before final_answer, make sure the plan accurately reflects what is complete and what remains.
             - Do not repeat the full plan in prose after calling update_plan; the UI already shows it.
+            - Restate the completion criteria to yourself before implementation and again before final_answer.
 
             Execution:
             - First understand the task, constraints, and completion criteria.
@@ -512,12 +425,14 @@ class Agent:
             - Reuse existing project patterns, naming, and structure.
             - Do not chase unrelated bugs, failing tests, or cleanup outside the task.
             - Avoid re-reading files you just wrote or patched unless something external may have changed them or you need exact lines.
+            - Prefer small, testable changes over sprawling rewrites.
 
             Debugging:
             - When behavior is wrong, identify the root cause before patching.
             - Form a concrete hypothesis, test it, and use the result to choose the next step.
             - Preserve useful observations from failures and use them to narrow the search.
             - Revisit assumptions quickly when results do not match expectations.
+            - Use targeted debugging aids when needed to inspect state and validate hypotheses, then clean them up when finished.
 
             Validation:
             - Validate changed behavior whenever practical.
@@ -528,6 +443,7 @@ class Agent:
             - Inspect generated images or reports when they matter to correctness.
             - Operate headlessly; do not rely on interactive plot windows like matplotlib show().
             - Do not claim to have run or verified anything you did not actually run or verify.
+            - After you believe you are done, verify the completion criteria one by one.
 
             Approvals and blockers:
             - Some tool calls may require user approval. If a change is rejected, absorb the feedback and continue.
@@ -539,23 +455,17 @@ class Agent:
             - Before final_answer, restate the completion criteria mentally and check them one by one.
             - Final responses should be concise, concrete, and honest about verification and remaining caveats.
             '''),
-    ) -> None:
+        ) -> None:
         self.name = name
         self.description = description or ""
-        # tools ----------------------------------------------------------
         self.tools: dict[str, Tool] = {t.name: t for t in tools}
-        # ensure final_answer is always present
         if "final_answer" not in self.tools:
             self.tools["final_answer"] = FinalAnswer()
-        # managed agents (need this before building system prompt) -------
         self.managed_agents: dict[str, Agent] = {a.name: a for a in managed_agents or []}
-        # system prompt --------------------------------------------------
         self.system_prompt: str = self._build_system_prompt(system_message, add_tools_to_system_prompt)
-        # model & memory -------------------------------------------------
         self.model = model
         self.memory = ConversationMemory()
         self.memory.append(ChatMessage.system(self.system_prompt))
-        # misc config ----------------------------------------------------
         self.max_steps = max_steps
         self.verbosity = verbosity
         self.trace_enabled = trace_enabled
@@ -563,37 +473,22 @@ class Agent:
         self.memory_threshold = memory_threshold
         self.clear_memory_on_run = clear_memory_on_run
         self.include_function_thoughts = include_function_thoughts
-        self.auto_save = auto_save
         self._current_plan: dict[str, Any] | None = None
-        self._pin_plan_in_footer: bool = False
         self._run_started_at: float | None = None
         self._latest_prompt_tokens: int | None = None
+        self._compact_single_agent_ui: bool = True
         self._current_local_step: int = 0
         self._status_message: str = "Idle"
         self._live: Live | None = None
         self._owns_live: bool = False
         self._task_preview: str = ""
-        
-        # Add inputs/output_type for use as a tool (when this agent is called by another agent)
-        self.inputs = {
-            "task": {
-                "type": "string", 
-                "description": f"Task for {self.name} to execute and report back on."
-            }
-        }
+        self.inputs = {"task": {"type": "string", "description": f"Task for {self.name} to execute and report back on."}}
         self.output_type = "string"
-        
-        self.tools.update(self.managed_agents)  # treat them like tools
-        # logging --------------------------------------------------------
+        self.tools.update(self.managed_agents)
         self._trace_dir = f"agent_traces_{_dt.datetime.now():%y%m%d_%H%M}"
-        #os.makedirs(self._trace_dir, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
     def run(self, task: str, *, reset: bool = None) -> str:  # noqa: D401
         """Run the agent until it produces a final answer."""
-        # Use the attribute value if reset parameter is not provided
         should_reset = self.clear_memory_on_run if reset is None else reset
         if should_reset:
             self.memory = ConversationMemory()
@@ -624,23 +519,17 @@ class Agent:
                     answer = self._take_action(specific_tools=['update_plan'])
                 else:
                     answer = self._take_action()
-                
-                # Write memory trace to file independently of console verbosity
                 if self.trace_enabled:
                     self._dump_trace()
-                
-                # Auto-summarize memory if it exceeds threshold
                 if self.memory_threshold and len(self.memory) > self.memory_threshold:
                     self._log(f"Memory threshold reached ({len(self.memory)} > {self.memory_threshold}), summarizing...", 2)
                     self.memory.summarize(self.model)
                     self._log(f"Memory summarized to {len(self.memory)} messages", 2)
-                    
                 if answer is not None:
                     self._log("Final answer produced", 1)
                     self._status_message = "Final answer ready"
                     self._refresh_live()
                     return answer
-            # ------------- exhausted budget - force summary ------------------
             self._log("Step budget exhausted - forcing summary", 1)
             self._status_message = "Summarizing"
             self._refresh_live()
@@ -649,13 +538,9 @@ class Agent:
         finally:
             self._stop_live_display()
 
-    # Let an Agent instance behave like a tool ------------------------------
     def __call__(self, *, task: str, reset: bool = None) -> str:  # noqa: D401
         return self.run(task, reset=reset)
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
     @classmethod
     def _increment_master_step(cls) -> None:  # noqa: D401
         cls._global_step += 1
@@ -664,33 +549,16 @@ class Agent:
         if self.model.debug and self.verbosity >= level:
             LOGGER.info("#%04d %s - %s", self._global_step, self.name, msg)
 
-    # ------------------------------------------------------------------
-    def _label_text(self, label: str, style: str = "bold bright_black") -> Text:
-        return Text(label, style=style)
-
     def _console_ref(self) -> Console | None:
         if self._live is not None:
             return self._live.console
         return _console
 
     def _ui_print(self, renderable: Any = "", *, style: str | None = None) -> None:
-        console = self._console_ref()
-        if console is not None:
-            if isinstance(renderable, str) and style:
-                console.print(Text(renderable, style=style))
-            else:
-                console.print(renderable)
-            return
-        if isinstance(renderable, Text):
-            print(renderable.plain)
-        else:
-            print(renderable)
+        _console_print(renderable, style=style, console=self._console_ref())
 
     def _ui_input(self, prompt: str) -> str:
-        console = self._console_ref()
-        if console is not None:
-            return console.input(prompt)
-        return input(prompt)
+        return _console_input(prompt, self._console_ref())
 
     def _build_plan_renderable(self) -> Panel | None:
         if not self._current_plan:
@@ -734,7 +602,13 @@ class Agent:
         if cwd_text.startswith(home):
             cwd_text = "~" + cwd_text[len(home):]
         step_text = f"step {self._current_local_step}/{self.max_steps}" if self._current_local_step else "step 0"
-        status_text = Text(_clip(self._status_message or "Working", 72), style="bold white")
+        status_value = self._status_message or "Working"
+        status_text = Text()
+        if status_value in {"Thinking", "Summarizing"}:
+            frames = ("-", "\\", "|", "/")
+            frame = frames[int(time.perf_counter() * 8) % len(frames)]
+            status_text.append(f"{frame} ", style="cyan")
+        status_text.append(_clip(status_value, 72), style="bold white")
         meta = Text()
         meta.append(model_id, style="bold bright_white")
         meta.append(" • ", style="bright_black")
@@ -748,16 +622,11 @@ class Agent:
         return Group(status_text, meta)
 
     def _build_live_renderable(self) -> Group:
-        parts: list[Any] = []
-        plan_panel = self._build_plan_renderable()
-        if self._pin_plan_in_footer and plan_panel is not None:
-            parts.append(plan_panel)
-        parts.append(self._build_status_renderable())
-        return Group(*parts)
+        return Group(self._build_status_renderable())
 
     def _refresh_live(self) -> None:
         if self._live is not None:
-            self._live.update(self._build_live_renderable(), refresh=True)
+            self._live.refresh()
 
     def _start_live_display(self) -> None:
         global _LIVE_DEPTH
@@ -771,6 +640,7 @@ class Agent:
             refresh_per_second=8,
             transient=False,
             vertical_overflow="visible",
+            get_renderable=self._build_live_renderable,
         )
         self._live.start()
         self._owns_live = True
@@ -796,9 +666,13 @@ class Agent:
     ) -> None:
         if self.verbosity < level:
             return
+        compact_ui = self._compact_single_agent_ui and not self.managed_agents
         prefix = f"{self._global_step:04d} {self.name}" if label is None else label
-        default_prefix = f"{self._global_step:04d} {self.name}"
-        prefix_width = max(16, len(default_prefix) + 2)
+        if compact_ui:
+            prefix_width = max(16, len(prefix) + 2 if prefix else 16)
+        else:
+            default_prefix = f"{self._global_step:04d} {self.name}"
+            prefix_width = max(16, len(default_prefix) + 2)
         prefix_block = f"{prefix:<{prefix_width}}" if prefix else " " * prefix_width
         wrapped_lines: list[str] = []
         console = self._console_ref()
@@ -920,121 +794,74 @@ class Agent:
             return False, response
 
     def _append_to_summary(self, summary: str) -> None:  # noqa: D401
-        """Append a line to the summary.txt file showing the agent action."""
         os.makedirs(self._trace_dir, exist_ok=True)
-        summary_file = os.path.join(self._trace_dir, "summary.txt")
-        summary_line = f"[{self._global_step}] {self.name} > {summary}\n"
-        with open(summary_file, "a", encoding="utf-8") as f:
-            f.write(summary_line)
-            
+        with open(os.path.join(self._trace_dir, "summary.txt"), "a", encoding="utf-8") as f:
+            f.write(f"[{self._global_step}] {self.name} > {summary}\n")
+
+    @staticmethod
+    def _trace_content(content: Any) -> str:
+        if not isinstance(content, list):
+            return str(content or "")
+        lines = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type", "unknown")
+            if part_type == "text":
+                lines.append(f"[Text content]: {part.get('text', '')}")
+                continue
+            if part_type == "image_url":
+                image_url = part.get("image_url", {}).get("url", "")
+                label = f"<image data - {len(image_url):,} characters>" if image_url.startswith("data:image") else image_url
+                lines.append(f"[Image content]: {label}")
+                continue
+            lines.append(f"[Other content type: {part_type}]")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _trace_tool_calls(tool_calls: Any) -> str:
+        serialised = []
+        for tc in tool_calls or []:
+            args = tc["function"].get("arguments", {})
+            try:
+                args = json.loads(args) if isinstance(args, str) else args
+            except Exception:
+                args = str(args)
+            if isinstance(args, dict):
+                args = {
+                    key: textwrap.fill(value, width=80) if isinstance(value, str) and len(value) > 100 else value
+                    for key, value in args.items()
+                }
+            serialised.append(
+                {
+                    "id": tc.get("id", ""),
+                    "type": "function",
+                    "function": {"name": tc["function"]["name"], "arguments": args},
+                }
+            )
+        return json.dumps(serialised, indent=2, ensure_ascii=False)
+
     def _dump_trace(self) -> None:  # noqa: D401
-        """Write memory trace to a file with global step counter and agent name."""
         os.makedirs(self._trace_dir, exist_ok=True)
         fname = os.path.join(self._trace_dir, f"step_{self._global_step:03d}_{self.name}.log")
+        blocks = []
+        for idx, msg in enumerate(self.memory, 1):
+            if msg.role == "assistant":
+                lines = [f"[{idx}] ASSISTANT [{self.name}]:", str(msg.content or "")]
+                if msg.tool_calls:
+                    lines.extend(["TOOL CALLS:", self._trace_tool_calls(msg.tool_calls)])
+                if getattr(msg, "usage", None):
+                    lines.append(f"[TOKENS: {getattr(msg.usage, 'total_tokens', 'unknown')}]")
+                blocks.append("\n".join(lines))
+                continue
+            label = f"[{idx}] TOOL RESPONSE from {msg.name}:" if msg.role == "tool" else f"[{idx}] {msg.role.upper()}:"
+            blocks.append(f"{label}\n{self._trace_content(msg.content)}")
         with open(fname, "w", encoding="utf-8") as f:
-            for idx, msg in enumerate(self.memory, 1):
-                role = msg.role.upper()
-                content = msg.content or ""
-                
-                # Write separator between messages
-                separator = "-" * 80
-                if idx > 1:
-                    f.write(f"\n{separator}\n\n")
-                
-                if msg.role == "assistant":
-                    f.write(f"[{idx}] {role} [{self.name}]:\n{content}\n")
-                    if msg.tool_calls:
-                        f.write("TOOL CALLS:\n")
-                        f.write("[\n")
-                        for tc in msg.tool_calls:
-                            f.write(f"  {{\n")
-                            f.write(f"    \"id\": \"{tc.get('id', '')}\",\n")
-                            f.write(f"    \"type\": \"function\",\n")
-                            f.write(f"    \"function\": {{\n")
-                            f.write(f"      \"name\": \"{tc['function']['name']}\",\n")
-                            
-                            # Format arguments for better display
-                            args = tc['function'].get('arguments', '{}')
-                            
-                            # Parse and format arguments
-                            try:
-                                # Handle both string and dict forms
-                                if isinstance(args, str):
-                                    args_obj = json.loads(args)
-                                else:
-                                    args_obj = args
-                                
-                                # Wrap long text values
-                                if isinstance(args_obj, dict):
-                                    for key, value in args_obj.items():
-                                        if isinstance(value, str) and len(value) > 100:
-                                            args_obj[key] = textwrap.fill(value, width=80)
-                                
-                                # Format with indentation and remove first level
-                                formatted_args = json.dumps(args_obj, indent=6, ensure_ascii=False)
-                                formatted_args = "\n".join(
-                                    line[2:] if line.startswith("  ") else line 
-                                    for line in formatted_args.split("\n")
-                                )
-                                
-                                f.write(f"      \"arguments\": {formatted_args}\n")
-                            except Exception:
-                                # Fallback for any formatting errors
-                                f.write(f"      \"arguments\": \"{str(args)}\"\n")
-                            
-                            f.write(f"    }}\n")
-                            f.write(f"  }}\n")
-                        f.write("]\n")
-                                            
-                    # Add token count if available
-                    if hasattr(msg, 'usage') and msg.usage:
-                        tokens_used = getattr(msg.usage, 'total_tokens', 'unknown')
-                        f.write(f"[TOKENS: {tokens_used}]\n")
-                    
-                elif msg.role == "tool":
-                    # # For tool responses, if it's view_image or read_pdf, handle specially
-                    # if msg.name in ["view_image", "read_pdf"]:
-                    #     # Show the formatted summary instead of raw data
-                    #     sanitized_content = content
-                    #     if msg.name == "view_image" and content.startswith("data:image"):
-                    #         sanitized_content = f"<image data - {len(content):,} characters>"
-                    #     f.write(f"[{idx}] TOOL RESPONSE from {msg.name}:\n{sanitized_content}\n")
-                    # else:
-                    f.write(f"[{idx}] TOOL RESPONSE from {msg.name}:\n{content}\n")
-                else:
-                    # Handle user messages, which might contain image data
-                    if msg.role == "user" and isinstance(content, list):
-                        # This is likely multimodal content with images
-                        f.write(f"[{idx}] {role}:\n")
-                        
-                        # Process each content part
-                        for part in content:
-                            if isinstance(part, dict):
-                                if part.get("type") == "text":
-                                    # For text parts, show the actual text
-                                    f.write(f"[Text content]: {part.get('text', '')}\n")
-                                elif part.get("type") == "image_url":
-                                    # For image parts, just show a placeholder
-                                    image_url = part.get("image_url", {}).get("url", "")
-                                    if image_url.startswith("data:image"):
-                                        f.write(f"[Image content]: <image data - {len(image_url):,} characters>\n")
-                                    else:
-                                        f.write(f"[Image content]: {image_url}\n")
-                                else:
-                                    f.write(f"[Other content type: {part.get('type', 'unknown')}]\n")
-                    else:
-                        # Regular user message with plain text
-                        f.write(f"[{idx}] {role}:\n{content}\n")
+            f.write(("\n" + "-" * 80 + "\n\n").join(blocks))
         self._log(f"Trace dumped to {fname}", 3)
 
-    # ------------------------------------------------------------------
     def _build_system_prompt(self, base: str, add_tools: bool) -> str:  # noqa: D401
-        # if not add_tools:
-        #     return base
-        # lines = [base, "", "Here are your tools:"]
-        
-        # Pre‑prepend the three reminders so they are always first
-        shared_tool_guidance = textwrap.dedent(
+        prompt = base.strip() + "\n\n" + textwrap.dedent(
             """
             Tool-use guidance:
             - Before a meaningful cluster of tool calls, use the commentary tool to briefly explain what you are about to do.
@@ -1045,96 +872,186 @@ class Agent:
             - Do not use commentary or update_plan as a substitute for making progress; after narrating or planning, do the work.
             """
         ).strip()
-
-        base_with_reminders = base.strip() + "\n\n" + shared_tool_guidance
-
-
         if not add_tools:
-            return base_with_reminders
-
-        lines = [base_with_reminders, "", "Here are your tools:"]
-
-        # Regular tools first
-        for tool in self.tools.values():
-            # Skip managed agents - they'll be handled separately
-            if tool in self.managed_agents.values():
-                continue
-            inp = ", ".join(f"{k}: {v['type']}" for k, v in tool.inputs.items()) or "None"
-            # lines.append(f"- {tool.name}: {tool.description} (inputs: {inp})")
-            lines.append(f"- {tool.name}: (inputs: {inp})")
-        
-        # Add managed agents section if we have any
+            return prompt
+        managed = list(self.managed_agents.values())
+        lines = [prompt, "", "Here are your tools:"]
+        lines.extend(
+            f"- {tool.name}: (inputs: {', '.join(f'{k}: {v['type']}' for k, v in tool.inputs.items()) or 'None'})"
+            for tool in self.tools.values()
+            if tool not in managed
+        )
         if self.managed_agents:
-            lines.append("\nYou can also give tasks to team members:")
-            lines.append("Calling a team member works the same as calling a tool: the only argument you need to provide is 'task', a string explaining what you want them to do.")
-            lines.append("Since these team members are specialized agents, be clear and detailed in your task descriptions.")
+            lines.extend(
+                [
+                    "\nYou can also give tasks to team members:",
+                    "Calling a team member works the same as calling a tool: the only argument you need to provide is 'task', a string explaining what you want them to do.",
+                    "Since these team members are specialized agents, be clear and detailed in your task descriptions.",
+                ]
+            )
             for agent in self.managed_agents.values():
-                description = getattr(agent, 'description', '')
-                if getattr(agent, 'clear_memory_on_run', False):
+                description = getattr(agent, "description", "")
+                if getattr(agent, "clear_memory_on_run", False):
                     description += " This team member starts with a clean memory for each task and needs comprehensive context."
                 lines.append(f"- {agent.name}: {description}")
-        
-        # lines.append("\nCall tools by returning a message that contains *only* a valid tool-call JSON object.")
         return "\n".join(lines)
 
-    # ------------------------------------------------------------------
-    def _take_action(self,specific_tools=None) -> str | None:  # noqa: D401 - returns final answer or None
-        """Send current memory to LLM, execute any tool calls, append responses."""
-        # ---- call the model -------------------------------------------
-        if specific_tools is None:
-            tools = [self._tool_to_openai(t) for t in self.tools.values()]
-        else:
-            tools = [self._tool_to_openai(t) for t in self.tools.values() if t.name in specific_tools]
+    def _recover_tool_calls(self, response_content: str | None, tool_calls: Any) -> tuple[str | None, Any]:
+        if tool_calls is not None:
+            return response_content, tool_calls
+        source = response_content or ""
+        if self.include_function_thoughts:
+            thought_part, tool_call_part = self._split_response_with_thoughts(source)
+            maybe_calls = self._extract_tool_calls(tool_call_part) if thought_part and tool_call_part else None
+            if maybe_calls:
+                return thought_part, maybe_calls
+        maybe_calls = self._extract_tool_calls(source)
+        return (None if maybe_calls else response_content), maybe_calls
+
+    def _tool_preview(self, name: str, target: Tool, args: dict[str, Any]) -> tuple[bool, Mapping[str, Any] | None]:
+        try:
+            requires_confirmation = target.needs_confirmation(**args)
+        except Exception:
+            requires_confirmation = False
+        if not requires_confirmation and self.verbosity < 2:
+            return requires_confirmation, None
+        try:
+            return requires_confirmation, target.build_preview(**args)
+        except Exception as exc:
+            return requires_confirmation, {
+                "kind": "text",
+                "title": f"Preview unavailable for {name}",
+                "body": str(exc),
+                "border_style": "red",
+            }
+
+    def _run_tool(self, name: str, target: Tool, args: dict[str, Any]) -> tuple[Mapping[str, Any] | None, bool, Any, int]:
+        requires_confirmation, preview = self._tool_preview(name, target, args)
+        approved, rejection_feedback, preview_shown = True, None, False
+        if requires_confirmation:
+            self._status_message = f"Awaiting approval: {name}"
+            self._refresh_live()
+            approved, rejection_feedback = self._prompt_for_approval(target, args, preview)
+            preview_shown = preview is not None
+        try:
+            if approved:
+                tool_started = time.perf_counter()
+                return preview, preview_shown, target(**args), int((time.perf_counter() - tool_started) * 1000)
+            return preview, preview_shown, target.rejection_result(rejection_feedback, **args), 0
+        except Exception as exc:  # pragma: no cover - runtime errors
+            return preview, preview_shown, f"ToolError[{name}]: {exc} ({traceback.format_exc().splitlines()[-1]})", 0
+
+    @staticmethod
+    def _image_part(url: str) -> dict[str, Any]:
+        return {"type": "image_url", "image_url": {"url": url, "detail": "auto"}}
+
+    @staticmethod
+    def _shell_result_for_memory(result: Any) -> str:
+        parsed = _parse_command_result(str(result))
+        if parsed.get("exit_code") is None:
+            return str(result)
+        lines = [f"[exit code] {parsed['exit_code']}"]
+        if parsed.get("status"):
+            lines.append(f"[status] {parsed['status']}")
+        output = parsed.get("output")
+        if output:
+            lines.append(output)
+        return "\n".join(lines)
+
+    def _content_for_memory(
+        self,
+        target: Tool,
+        result: Any,
+        args: dict[str, Any],
+        image_parts: list[dict[str, Any]],
+    ) -> str:
+        if getattr(target, "name", "") == "shell":
+            return self._shell_result_for_memory(result)
+        if getattr(target, "output_type", "") == "image" and isinstance(result, str) and result.startswith("data:image"):
+            image_parts.append(self._image_part(result))
+            return f"<{os.path.basename(args.get('filename', 'image'))} • {len(result):,} chars>"
+        if getattr(target, "output_type", "") == "object" and isinstance(result, dict) and "images" in result:
+            text_blocks = [
+                f"Page {item['page']}:\n{item['content'].strip()}"
+                for item in result.get("text", [])
+                if "page" in item and item.get("content", "").strip()
+            ]
+            if text_blocks:
+                image_parts.append({"type": "text", "text": "Extracted PDF Text:\n\n" + "\n\n".join(text_blocks)})
+            image_parts.extend(
+                self._image_part(img["data"])
+                for img in result.get("images", [])
+                if img.get("data", "").startswith("data:image")
+            )
+            page_info = f"page {args.get('page', 'all')}" if "page" in args else "all pages"
+            return (
+                f"<PDF: {os.path.basename(args.get('filename', 'document.pdf'))} • {page_info} • "
+                f"{len(result.get('text', []))} text blocks, {len(result.get('images', []))} images>"
+            )
+        return str(result)
+
+    def _remember_plan(self, target: Tool) -> None:
+        last_plan = getattr(target, "_last_plan", None)
+        if not last_plan:
+            return
+        self._current_plan = {
+            "explanation": last_plan.get("explanation"),
+            "plan": list(last_plan.get("plan", [])),
+        }
+        self._refresh_live()
+
+    @staticmethod
+    def _result_style(result_summary: str) -> str:
+        lowered = result_summary.lower()
+        if "rejected by user" in lowered:
+            return "yellow"
+        if any(term in lowered for term in ("toolerror", "failed", "not found", "invalid", "timed out")) or lowered.startswith("error"):
+            return "red"
+        return "green"
+
+    def _result_summary(self, target: Tool, result: Any, args: dict[str, Any], elapsed_ms: int) -> str:
+        try:
+            summary = target.describe_result(result, **args)
+        except Exception:
+            lines = str(result).splitlines()
+            summary = _clip(lines[0] if lines else str(result), 120)
+        return f"{summary} ({elapsed_ms} ms)" if elapsed_ms and summary else summary
+
+    def _render_tool_details(self, name: str, target: Tool, result: Any, args: dict[str, Any]) -> None:
+        try:
+            result_detail = target.build_result_details(result, **args)
+        except Exception as exc:
+            result_detail = {
+                "kind": "text",
+                "title": f"{name} details unavailable",
+                "body": str(exc),
+                "border_style": "red",
+            }
+        self._render_detail(result_detail, force=bool(name == "update_plan" and result_detail and self.verbosity >= 1))
+
+    def _take_action(self, specific_tools=None) -> str | None:  # noqa: D401
+        tools = [self._tool_to_openai(t) for t in self.tools.values() if specific_tools is None or t.name in specific_tools]
         self._status_message = "Thinking"
         self._refresh_live()
         msg = self.model.chat(messages=self.memory.to_openai(), tools=tools)
-        response_content = msg.content
-        # tool_calls = getattr(msg, "tool_calls", None)
-        tool_calls = _normalise_tool_calls(getattr(msg, "tool_calls", None))
-        
-        # Handle thought pieces before tool calls if enabled
-        if tool_calls is None:  # fallback to regex salvage
-            if self.include_function_thoughts:
-                # Check if this response has thought pieces before tool calls
-                thought_part, tool_call_part = self._split_response_with_thoughts(response_content or "")
-                
-                if thought_part and tool_call_part:
-                    # Extract tool calls from the tool call part
-                    maybe_calls = self._extract_tool_calls(tool_call_part)
-                    if maybe_calls:
-                        tool_calls = maybe_calls
-                        response_content = thought_part  # Use the thought part as the response content
-                else:
-                    # Try regular extraction on the full content
-                    maybe_calls = self._extract_tool_calls(response_content or "")
-                    if maybe_calls:
-                        tool_calls = maybe_calls
-                        response_content = None
-            else:
-                # Original behavior: extract from full content without splitting
-                maybe_calls = self._extract_tool_calls(response_content or "")
-                if maybe_calls:
-                    tool_calls = maybe_calls
-                    response_content = None
-                    
+        response_content, tool_calls = self._recover_tool_calls(
+            msg.content,
+            _normalise_tool_calls(getattr(msg, "tool_calls", None)),
+        )
         assistant_msg = ChatMessage.assistant(response_content, tool_calls=tool_calls)
-        # Transfer usage information from API response to our ChatMessage object
-        if hasattr(msg, 'usage'):
+        if hasattr(msg, "usage"):
             assistant_msg.usage = msg.usage
         self.memory.append(assistant_msg)
         self._render_assistant_message(assistant_msg)
         self._render_usage(assistant_msg)
-        # ---- dispatch tool calls --------------------------------------
-        if not tool_calls:  # No tool was called - instruct agent to use a tool
+        if not tool_calls:
             self._log("No tool call used, instructing the agent to try again", 1)
-            msg = "You must use a tool call. Which tool will let you proceed? Use final_answer if you are FINISHED, otherwise use a different tool."
-            self.memory.append(ChatMessage.user(msg))
+            self.memory.append(ChatMessage.user(
+                "You must use a tool call. Think about which tool will let you proceed. Use final_answer tool if you are FINISHED, otherwise use a different tool."
+            ))
             return None
-            
-        # Dump trace before processing any tool calls to capture pre-execution state
         if self.trace_enabled:
             self._dump_trace()
-            
         final_answer: str | None = None
         image_parts: list[dict[str, Any]] = []
         for tc in tool_calls:
@@ -1147,7 +1064,6 @@ class Agent:
                 self.memory.append(ChatMessage.tool(name=name, tool_call_id=tc.get("id", "call_0"), result=err))
                 self._render_event(err, label="", style="red")
                 continue
-
             try:
                 call_summary = target.describe_call(**args)
             except Exception:
@@ -1156,189 +1072,50 @@ class Agent:
             self._append_to_summary(call_display)
             self._status_message = call_display
             self._refresh_live()
-            if name == "commentary":
-                self._render_event(call_summary, label="commentary", style="white")
-            else:
-                self._render_event(call_display, style="cyan")
-
-            preview: Mapping[str, Any] | None = None
-            preview_shown = False
-            try:
-                requires_confirmation = target.needs_confirmation(**args)
-            except Exception:
-                requires_confirmation = False
-            if requires_confirmation or self.verbosity >= 2:
-                try:
-                    preview = target.build_preview(**args)
-                except Exception as exc:
-                    preview = {
-                        "kind": "text",
-                        "title": f"Preview unavailable for {name}",
-                        "body": str(exc),
-                        "border_style": "red",
-                    }
-
-            approved = True
-            rejection_feedback: str | None = None
-            if requires_confirmation:
-                self._status_message = f"Awaiting approval: {name}"
-                self._refresh_live()
-                approved, rejection_feedback = self._prompt_for_approval(target, args, preview)
-                preview_shown = preview is not None
-
-            try:
-                if approved:
-                    tool_started = time.perf_counter()
-                    result = target(**args)
-                    elapsed_ms = int((time.perf_counter() - tool_started) * 1000)
-                else:
-                    result = target.rejection_result(rejection_feedback, **args)
-                    elapsed_ms = 0
-            except Exception as exc:  # pragma: no cover - runtime errors
-                result = f"ToolError[{name}]: {exc} ({traceback.format_exc().splitlines()[-1]})"
-                elapsed_ms = 0
-            
-            content_for_log = str(result)
-
-            # Capture any image data-URI returned by tools
-            if (getattr(target, "output_type", "") == "image"
-                and isinstance(result, str)
-                and result.startswith("data:image")):
-                image_parts.append(
-                    {"type": "image_url",
-                    "image_url": {"url": result, 
-                                  "detail": "auto"}} # or low/high
+            compact_ui = self._compact_single_agent_ui and not self.managed_agents
+            self._render_event(
+                call_summary if (name == "commentary" or compact_ui) else call_display,
+                label="commentary" if name == "commentary" else (name if compact_ui else None),
+                style="white" if name == "commentary" else "cyan",
+            )
+            preview, preview_shown, result, elapsed_ms = self._run_tool(name, target, args)
+            self.memory.append(
+                ChatMessage.tool(
+                    name=name,
+                    tool_call_id=tc.get("id", "call_0"),
+                    result=self._content_for_memory(target, result, args, image_parts),
                 )
-                basename = os.path.basename(args.get("filename", "image"))
-                content_for_log = f"<{basename} • {len(result):,} chars>"
-            # Handle PDF results which contain both text and images
-            elif (getattr(target, "output_type", "") == "object" 
-                  and isinstance(result, dict) 
-                  and "images" in result):
-                # Extract images from PDF result
-                pdf_images = result.get("images", [])
-                
-                # First add any text content as a text element
-                if "text" in result and result["text"]:
-                    text_blocks = []
-                    for text_item in result["text"]:
-                        if "page" in text_item and "content" in text_item:
-                            page_num = text_item["page"]
-                            content = text_item["content"].strip()
-                            if content:  # Only add non-empty text
-                                text_blocks.append(f"Page {page_num}:\n{content}")
-                    
-                    if text_blocks:
-                        # Add text content first in the image_parts array
-                        image_parts.append({
-                            "type": "text", 
-                            "text": "Extracted PDF Text:\n\n" + "\n\n".join(text_blocks)
-                        })
-                
-                # Then add all images to the same array
-                for img_data in pdf_images:
-                    if "data" in img_data and img_data["data"].startswith("data:image"):
-                        image_parts.append({
-                            "type": "image_url",
-                            "image_url": {"url": img_data["data"], 
-                                          "detail": "auto"}
-                        })
-                
-                # Create a log-friendly version that summarizes the content
-                filename = args.get("filename", "document.pdf")
-                page_info = f"page {args.get('page', 'all')}" if "page" in args else "all pages"
-                text_count = len(result.get("text", []))
-                img_count = len(pdf_images)
-                content_for_log = f"<PDF: {os.path.basename(filename)} • {page_info} • {text_count} text blocks, {img_count} images>"
-
-            self.memory.append(ChatMessage.tool(
-                name=name,
-                tool_call_id=tc.get("id", "call_0"),
-                result=content_for_log))
-                
+            )
             if name == "final_answer":
                 final_answer = args.get("answer", str(result))
             elif name == "update_plan":
-                last_plan = getattr(target, "_last_plan", None)
-                if last_plan:
-                    self._current_plan = {
-                        "explanation": last_plan.get("explanation"),
-                        "plan": list(last_plan.get("plan", [])),
-                    }
-                    self._refresh_live()
-
-            try:
-                result_summary = target.describe_result(result, **args)
-            except Exception:
-                lines = str(result).splitlines()
-                result_summary = _clip(lines[0] if lines else str(result), 120)
-
-            if elapsed_ms and result_summary:
-                result_summary = f"{result_summary} ({elapsed_ms} ms)"
-            lowered_summary = result_summary.lower()
-            if "rejected by user" in lowered_summary:
-                result_style = "yellow"
-            elif (
-                lowered_summary.startswith("error")
-                or "toolerror" in lowered_summary
-                or "failed" in lowered_summary
-                or "not found" in lowered_summary
-                or "invalid" in lowered_summary
-                or "timed out" in lowered_summary
-            ):
-                result_style = "red"
-            else:
-                result_style = "green"
+                self._remember_plan(target)
+            result_summary = self._result_summary(target, result, args, elapsed_ms)
             if result_summary:
-                self._render_event(result_summary, label="", style=result_style)
-
+                self._render_event(result_summary, label="", style=self._result_style(result_summary))
             if preview and not preview_shown and self.verbosity >= 2 and preview.get("kind") in {"diff", "code"}:
                 self._render_detail(preview)
-
-            try:
-                result_detail = target.build_result_details(result, **args)
-            except Exception as exc:
-                result_detail = {
-                    "kind": "text",
-                    "title": f"{name} details unavailable",
-                    "body": str(exc),
-                    "border_style": "red",
-                }
-            if (
-                name == "update_plan"
-                and result_detail
-                and self.verbosity >= 1
-                and not self._pin_plan_in_footer
-            ):
-                self._render_detail(result_detail, force=True)
-            else:
-                self._render_detail(result_detail)
+            self._render_tool_details(name, target, result, args)
             if name != "commentary":
                 self._status_message = result_summary or f"{name} complete"
                 self._refresh_live()
-
-        # Feed images back to the model so it can "see" them
         if image_parts:
             self.memory.append(ChatMessage.user(image_parts))
-
         return final_answer
 
-    # ------------------------------------------------------------------
     def _summarize_for_final(self) -> str:  # noqa: D401
-        """Force a summary via *final_answer* tool after step budget exhausted."""
         summary_prompt = "Summarise the current progress so the user can continue on their own."
-        # Only *final_answer* tool is allowed
-        msg = self.model.chat(messages=self.memory.to_openai() + [ChatMessage.user(summary_prompt).to_openai()],
-                               tools=[self._tool_to_openai(self.tools["final_answer"])])
+        msg = self.model.chat(
+            messages=self.memory.to_openai() + [ChatMessage.user(summary_prompt).to_openai()],
+            tools=[self._tool_to_openai(self.tools["final_answer"])],
+        )
         tool_calls = _normalise_tool_calls(getattr(msg, "tool_calls", None))
-        if tool_calls is None:
+        if not tool_calls:
             return msg.content
-        tc = tool_calls[0] #if getattr(msg, "tool_calls", None) else None
+        tc = tool_calls[0]
         if tc and tc["function"]["name"] == "final_answer":
-            answer = json.loads(tc["function"].get("arguments", "{}")).get("answer", "")
-            return answer
-        # # Fallback: return raw content
-        # return msg.content or "(no summary)"
+            return json.loads(tc["function"].get("arguments", "{}")).get("answer", "")
+        return msg.content or ""
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -1377,37 +1154,17 @@ class Agent:
             },
         }
 
-    # ------------------------------------------------------------------
     @staticmethod
     def _split_response_with_thoughts(text: str) -> tuple[str | None, str | None]:
-        """Split response into thought part and tool call part for any pattern."""
         if not text:
             return None, None
-            
-        # Find the earliest tool call pattern match
-        earliest_match = None
-        earliest_start = len(text)
-        
-        for pat in _PATTERNS:
-            for m in pat.finditer(text):
-                if m.start() < earliest_start:
-                    earliest_start = m.start()
-                    earliest_match = m
-                break  # Only need the first match for each pattern
-        
-        if not earliest_match:
+        matches = [match for pat in _PATTERNS if (match := pat.search(text))]
+        if not matches:
             return None, None
-            
-        # Split at the start of the earliest tool call
-        tool_call_start = earliest_match.start()
-        
-        # Extract the thought part (everything before the tool call)
-        thought_part = text[:tool_call_start].strip()
-        
-        # Extract the tool call part (from the tool call to the end)
-        tool_call_part = text[tool_call_start:].strip()
-        
-        return thought_part if thought_part else None, tool_call_part if tool_call_part else None
+        tool_call_start = min(match.start() for match in matches)
+        thought_part = text[:tool_call_start].strip() or None
+        tool_call_part = text[tool_call_start:].strip() or None
+        return thought_part, tool_call_part
 
     @staticmethod
     def _extract_tool_calls(text: str) -> list[dict[str, Any]]:  # noqa: D401
@@ -1439,17 +1196,6 @@ class Agent:
                     continue
         return calls
 
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _populate(tmpl: str, **vars: Any) -> str:  # noqa: D401
-        out = tmpl
-        for k, v in vars.items():
-            out = out.replace(f"{{{{ {k} }}}}", str(v)).replace(f"{{{{{k}}}}}", str(v))
-        return out
-
-    # ------------------------------------------------------------------
-    # Session snapshot helpers
-    # ------------------------------------------------------------------
     def snapshot(self) -> dict:  # noqa: D401
         return {
             "version": 1,
@@ -1509,11 +1255,9 @@ class Agent:
             memory_threshold=ag.get("memory_threshold"),
             include_function_thoughts=ag.get("include_function_thoughts", True),
         )
-        # rebuild memory
         inst.memory = ConversationMemory()
         for msg in session.get("memory", []):
             inst.memory.append(ChatMessage.from_session(msg))
-        # restore master counter and trace directory
         try:
             cls._global_step = int(session.get("global_step", 0))
         except Exception:
@@ -1523,11 +1267,6 @@ class Agent:
             inst._trace_dir = td
         inst._current_plan = session.get("current_plan")
         return inst
-
-###############################################################################
-# CLI convenience entry-point
-###############################################################################
-
 
 def _find_latest_session(session_dir: str) -> Optional[str]:  # noqa: D401
     try:
@@ -1544,6 +1283,207 @@ def _find_latest_session(session_dir: str) -> Optional[str]:  # noqa: D401
         return files[0]
     except Exception:
         return None
+
+_MANAGER_PROMPT = textwrap.dedent('''You are the *manager_agent* - a senior engineer. Your first
+    task is to use the update_plan tool. In the plan you should start with
+    Goal: <the overall goal of the task -- restating it in your own words>
+    Completion Criteria: <what did the user specify that would complete the task. Be complete and precise>
+    Next, break the user's high-level request into a numbered sequence of
+    concrete, executable steps (and sub-steps if necessary). Each step MUST include:
+    (1) a clear instruction for the code_agent
+    (2) any parameters or file names needed, and
+    (3) explicit completion criteria. You are the expert in this area,
+    so be very clear about the details and instructions so the code_agent doesn't
+    have to fill in too many blanks. If code is requested, make sure to ask for it to
+    be run and tested also.
+
+    Your plan should not be overly complex -- accomplish the task in the minimal
+    number of steps necessary. Do NOT ask the agent to write scaffolding files first.
+    Do NOT ask the agent not use a virtual environment or git repo or install anyything.
+
+    Then you must delegate the to the `code_agent` and
+    wait for its report. You should delegate enough steps that the code_agent can complete
+    then in a ~few function calls (eg write a few files and test them).
+    This agent does not know ANY context about the task, so
+    be sure to provide complete instructions and background information.
+
+    When a step is reported complete, mark it as
+    done and delegate the next. The code_agent does not know of any
+    previous work so be sure to give complete and verbose context. At each
+    step you must give full context to the code_agent, including a summary of any
+    previous steps.
+
+    Once you are confident all steps have been FULLY completed, pass the results
+    to the judge agent, fully explaining what the task was, the completion criteria, and
+    the solution. The judge agent will look at the results and report back if the
+    task is finished or not. Only after this has been complete, you can call final_answer
+    and report the results to the user.''')
+
+_JUDGE_PROMPT = (
+    "You are the *judge_agent* - an impartial evaluator. Your role is to objectively assess work against "
+    "specific success criteria. When evaluating, you should:\n"
+    "1. Clearly state each success criterion\n"
+    "2. Examine the relevant files/outputs to determine if criteria are met\n"
+    "3. For each criterion, provide a clear PASS/FAIL assessment with evidence\n"
+    "4. For any failures, explain why the criterion wasn't met\n"
+    "Your evaluation should be thorough, evidence-based, and focus solely on whether the specified "
+    "success criteria have been met, not on subjective qualities of the implementation."
+)
+
+
+def _read_task(task: str | None) -> str | None:
+    if not task:
+        return None
+    if not task.endswith(".txt"):
+        return task
+    with open(task, encoding="utf-8") as f:
+        return f.read()
+
+
+def _resolve_resume_path(args: argparse.Namespace) -> str | None:
+    if not args.resume:
+        return None
+    if args.resume != "LATEST":
+        return args.resume
+    session_dir = args.session_dir or os.path.join(os.getcwd(), ".ants_sessions")
+    resume_path = _find_latest_session(session_dir)
+    message = f"Resuming latest session: {resume_path}" if resume_path else f"No session found in {session_dir}; starting fresh."
+    _console_print(message, style="bright_black")
+    return resume_path
+
+
+def _copy_into_workdir(source_path: str, workdir: str) -> None:
+    if not source_path:
+        return
+    if not os.path.exists(source_path):
+        _console_print(f"Warning: Source path {source_path} not found, skipping copy", style="yellow")
+        return
+    dest_path = os.path.join(workdir, os.path.basename(source_path))
+    _console_print(
+        f"copying {'directory' if os.path.isdir(source_path) else 'file'} {source_path} to {dest_path}",
+        style="bright_black",
+    )
+    if os.path.isdir(source_path):
+        shutil.copytree(source_path, dest_path)
+    else:
+        shutil.copy2(source_path, dest_path)
+
+
+def _enter_workdir(args: argparse.Namespace) -> str | None:
+    if not args.wkdir:
+        return None
+    cwd = os.getcwd()
+    workdir = os.path.join(cwd, f"work/tmp_{_dt.datetime.now():%y%m%d_%H%M}")
+    os.makedirs(workdir, exist_ok=True)
+    _console_print(f"moving to {workdir}", style="bright_black")
+    _copy_into_workdir(args.cp, workdir)
+    os.chdir(workdir)
+    return cwd
+
+
+def _code_tools(args: argparse.Namespace) -> list[Tool]:
+    tools = [
+        WriteFile(confirm_edits=args.confirm_edits),
+        ReadFile(),
+        SearchFiles(),
+        EditFile(confirm_edits=args.confirm_edits),
+        Shell(confirm_commands=args.confirm_shell),
+        Commentary(),
+        UpdatePlan(),
+        ListFiles(),
+        FinalAnswer(),
+    ]
+    if not args.multi:
+        tools.insert(-1, ReadPDF())
+    if args.vision:
+        tools.insert(-1, ViewImage())
+    return tools
+
+
+def _manager_tools(args: argparse.Namespace) -> list[Tool]:
+    tools = [
+        ListFiles(),
+        SearchFiles(),
+        MakePlan(),
+        Reflect(),
+        Commentary(),
+        ReadFile(),
+        RunPython(),
+        Shell(confirm_commands=args.confirm_shell),
+        FinalAnswer(),
+    ]
+    if args.vision:
+        tools[-1:-1] = [ReadPDF(), ViewImage()]
+    if args.confirm_plan:
+        tools.append(GetUserInput())
+    return tools
+
+
+def _build_code_agent(args: argparse.Namespace, model: LLMClient, tools: list[Tool], resume_path: str | None) -> Agent:
+    if not resume_path:
+        return Agent(
+            tools=tools,
+            model=model,
+            max_steps=25,
+            verbosity=args.verbosity,
+            trace_enabled=not args.no_trace,
+            planning_interval=args.planning,
+            name="code_agent",
+            description="Writes/tests Python projects",
+        )
+    session = Agent.load_session(resume_path)
+    if args.chdir_on_resume and "cwd" in session and os.path.isdir(session["cwd"]):
+        os.chdir(session["cwd"])
+    agent = Agent.from_session(session, model=model, tools=tools)
+    agent.trace_enabled = not args.no_trace
+    return agent
+
+
+def _build_multi_agent(args: argparse.Namespace, model: LLMClient, agent_code: Agent) -> Agent:
+    agent_code.clear_memory_on_run = True
+    tools = _manager_tools(args)
+    judge_agent = Agent(
+        tools=tools,
+        model=model,
+        system_message=_JUDGE_PROMPT,
+        verbosity=args.verbosity,
+        trace_enabled=not args.no_trace,
+        max_steps=15,
+        name="judge_agent",
+        description="Evaluates work against success criteria and provides objective assessment.",
+        clear_memory_on_run=True,
+    )
+    return Agent(
+        tools=tools,
+        model=model,
+        system_message=_MANAGER_PROMPT,
+        managed_agents=[agent_code, judge_agent],
+        max_steps=25,
+        verbosity=args.verbosity,
+        trace_enabled=not args.no_trace,
+        planning_interval=args.planning,
+        name="manager_agent",
+        description="Magnages coding agents",
+    )
+
+
+def _interactive_loop(agent: Agent) -> None:
+    while True:
+        _console_print("end to quit • compact to summarize memory", style="italic bright_black")
+        follow = _console_input("› ").strip()
+        cmd = follow.lower()
+        if cmd == "end":
+            return
+        if cmd == "compact":
+            before = len(agent.memory)
+            agent.memory.summarize(agent.model)
+            _console_print(f"Memory compacted: {before} -> {len(agent.memory)} messages", style="bright_black")
+            agent.save_session()
+            continue
+        agent.max_steps += 20
+        _render_final_answer_panel(agent.run(follow, reset=False), title="Assistant")
+        agent.save_session()
+
 
 def main() -> None:  # noqa: D401
     parser = argparse.ArgumentParser(description="Run the autonomous Agent")
@@ -1581,228 +1521,28 @@ def main() -> None:  # noqa: D401
     if args.debug:
         logging.getLogger("agent").setLevel(logging.INFO)
         logging.getLogger("agent.tools").setLevel(logging.INFO)
-
-
-
-    # Resolve resume path if requested
-    resume_path: Optional[str] = None
-    if args.resume:
-        if args.resume == "LATEST":
-            session_dir = args.session_dir or os.path.join(os.getcwd(), ".ants_sessions")
-            resume_path = _find_latest_session(session_dir)
-            if resume_path:
-                _console_print(f"Resuming latest session: {resume_path}", style="bright_black")
-            else:
-                _console_print(f"No session found in {session_dir}; starting fresh.", style="bright_black")
-        else:
-            resume_path = args.resume
-
-    # Determine user task, avoid prompting when resuming without a task
-    if resume_path:
-        if args.task and args.task.endswith(".txt"):
-            user_task = open(args.task).read()
-        elif args.task:
-            user_task = args.task
-        else:
-            user_task = None
-    else:
-        # If task ends with .txt, assume it's a file path and read from it
-        if args.task and args.task.endswith(".txt"):
-            user_task = open(args.task).read()
-        elif args.task:
-            user_task = args.task
-        else:
-            # Fall back to prompting if no task provided
-            user_task = _console_input("Enter your task: ")
-
-
-    if args.wkdir:
-        cwd = None
-        if cwd is None:
-            cwd = os.getcwd()
-
-        workdir = os.path.join(cwd,'work/tmp_'+_dt.datetime.now().strftime('%y%m%d_%H%M'))
-        os.makedirs(workdir,exist_ok=True)
-        _console_print(f"moving to {workdir}", style="bright_black")
-        
-        # Handle --cp flag if it's provided
-        if args.cp:
-            source_path = args.cp
-            if os.path.exists(source_path):
-                dest_name = os.path.basename(source_path)
-                dest_path = os.path.join(workdir, dest_name)
-                
-                if os.path.isdir(source_path):
-                    # For directories, use copytree
-                    _console_print(f"copying directory {source_path} to {dest_path}", style="bright_black")
-                    shutil.copytree(source_path, dest_path)
-                else:
-                    # For files, use copy2 (preserves metadata)
-                    _console_print(f"copying file {source_path} to {dest_path}", style="bright_black")
-                    shutil.copy2(source_path, dest_path)
-            else:
-                _console_print(f"Warning: Source path {source_path} not found, skipping copy", style="yellow")
-        
-        os.chdir(workdir)
-
-    # tools_all = [
-    #     WriteFile(), ReadFile(), SearchFiles(), EditFile_patch(), EditFile(confirm_edits=args.confirm_edits), RunPython(),
-    #     RunBash(), Shell(), Delete(confirm_edits=args.confirm_edits),
-    #     MakePlan(), Reflect(), ListFiles(), FinalAnswer()
-    # ]
-    tools_all = [
-        WriteFile(confirm_edits=args.confirm_edits), ReadFile(), SearchFiles(), EditFile(confirm_edits=args.confirm_edits), #EditFile_patch(),# , RunPython(),
-        Shell(confirm_commands=args.confirm_shell), Commentary(), UpdatePlan(), ListFiles(), FinalAnswer()
-    ]
-
-    if not args.multi:
-        tools_all.insert(-1,ReadPDF())
-    if args.vision:
-        tools_all.insert(-1,ViewImage())
+    resume_path = _resolve_resume_path(args)
+    user_task = _read_task(args.task) if args.task or resume_path else _console_input("Enter your task: ")
+    if resume_path and not args.task:
+        user_task = None
+    cwd = _enter_workdir(args)
+    tools_all = _code_tools(args)
 
     model = LLMClient(
         model_id="lmstudio" if args.local else args.model,
         debug=args.debug,
-       # temperature=1.,
         api_base="http://localhost:1234/v1" if args.local else None,
     )
-
-    if resume_path:
-        session = Agent.load_session(resume_path)
-        if args.chdir_on_resume and "cwd" in session and os.path.isdir(session["cwd"]):
-            os.chdir(session["cwd"])
-        agent = Agent.from_session(session, model=model, tools=tools_all)
-        agent.trace_enabled = not args.no_trace
-    else:
-        agent = Agent(tools=tools_all,
-                        model=model,
-                        max_steps=25,
-                        verbosity=args.verbosity,
-                        trace_enabled=not args.no_trace,
-                        planning_interval=args.planning,
-                        name="code_agent",
-                        description="Writes/tests Python projects")
-    
+    agent = _build_code_agent(args, model, tools_all, resume_path)
     if args.multi:
-        agent_code = agent
-        agent_code.clear_memory_on_run = True
-
-        manager_prompt = textwrap.dedent('''You are the *manager_agent* - a senior engineer. Your first 
-            task is to use the update_plan tool. In the plan you should start with 
-            Goal: <the overall goal of the task -- restating it in your own words> 
-            Completion Criteria: <what did the user specify that would complete the task. Be complete and precise> 
-            Next, break the user's high-level request into a numbered sequence of 
-            concrete, executable steps (and sub-steps if necessary). Each step MUST include: 
-            (1) a clear instruction for the code_agent 
-            (2) any parameters or file names needed, and 
-            (3) explicit completion criteria. You are the expert in this area, 
-            so be very clear about the details and instructions so the code_agent doesn't 
-            have to fill in too many blanks. If code is requested, make sure to ask for it to
-            be run and tested also.
-                                         
-            Your plan should not be overly complex -- accomplish the task in the minimal 
-            number of steps necessary. Do NOT ask the agent to write scaffolding files first. 
-            Do NOT ask the agent not use a virtual environment or git repo or install anyything.
-            
-            Then you must delegate the to the `code_agent` and 
-            wait for its report. You should delegate enough steps that the code_agent can complete
-            then in a ~few function calls (eg write a few files and test them).
-            This agent does not know ANY context about the task, so
-            be sure to provide complete instructions and background information.
-                                         
-            When a step is reported complete, mark it as 
-            done and delegate the next. The code_agent does not know of any 
-            previous work so be sure to give complete and verbose context. At each 
-            step you must give full context to the code_agent, including a summary of any
-            previous steps.
-                                         
-            Once you are confident all steps have been FULLY completed, pass the results
-            to the judge agent, fully explaining what the task was, the completion criteria, and
-            the solution. The judge agent will look at the results and report back if the
-            task is finished or not. Only after this has been complete, you can call final_answer
-            and report the results to the user.''')
-
-        tools_manager = [
-            ListFiles(), SearchFiles(), MakePlan(), Reflect(), Commentary(), ReadFile(), RunPython(), Shell(confirm_commands=args.confirm_shell), FinalAnswer()
-        ]
-        if args.vision:
-            tools_manager.insert(-1,ReadPDF())
-            tools_manager.insert(-1,ViewImage())
-
-        if args.confirm_plan:
-            tools_manager.append(GetUserInput())
-
-
-        # Create a judge agent
-        judge_prompt = ("You are the *judge_agent* - an impartial evaluator. Your role is to objectively assess work against "
-                    "specific success criteria. When evaluating, you should:\n"
-                    "1. Clearly state each success criterion\n"
-                    "2. Examine the relevant files/outputs to determine if criteria are met\n"
-                    "3. For each criterion, provide a clear PASS/FAIL assessment with evidence\n"
-                    "4. For any failures, explain why the criterion wasn't met\n"
-                    "Your evaluation should be thorough, evidence-based, and focus solely on whether the specified "
-                    "success criteria have been met, not on subjective qualities of the implementation.")
-
-
-        judge_agent = Agent(
-            tools=tools_manager,
-            model=model,  # Using the stronger model for evaluation
-            system_message=judge_prompt,
-            verbosity=args.verbosity,
-            trace_enabled=not args.no_trace,
-            max_steps=15,
-            name="judge_agent",
-            description="Evaluates work against success criteria and provides objective assessment.",
-            clear_memory_on_run=True,  # Starts with a clean memory for each evaluation
-        )
-
-
-        agent = Agent(tools=tools_manager,
-                        model=model,
-                        system_message=manager_prompt,
-                        managed_agents=[agent_code,judge_agent],
-                        max_steps=25,
-                        verbosity=args.verbosity,
-                        trace_enabled=not args.no_trace,
-                        planning_interval=args.planning,
-                        name="manager_agent",
-                        description="Magnages coding agents")
-    
-        if args.confirm_plan:
-                manager_prompt+="\n\nAfter creating the plan, ask the user for any further changes or approval."
-        
+        agent = _build_multi_agent(args, model, agent)
     if user_task:
         result = agent.run(user_task, reset=False if resume_path else None)
         _render_final_answer_panel(result)
         agent.save_session()
-
-    # optional interactive loop -------------------------------------------
-    while True and not args.end:
-        follow = _console_input("Feedback (or 'end' to save and quit, 'compact' to summarize memory): ").strip()
-        cmd = follow.lower()
-
-        if cmd == "end":
-            # session_dir = args.session_dir or os.path.join(os.getcwd(), ".ants_sessions")
-            # os.makedirs(session_dir, exist_ok=True)
-            # session_path = os.path.join(session_dir, f"{agent.name}_{_dt.datetime.now():%y%m%d_%H%M%S}.json")
-            # agent.save_session(session_path)
-            # print(f"Session saved to {session_path}")
-            # print(f"Resume with:\n  --resume \"{session_path}\"")
-            break
-
-        if cmd == "compact":
-            before = len(agent.memory)
-            agent.memory.summarize(agent.model)
-            after = len(agent.memory)
-            _console_print(f"Memory compacted: {before} -> {after} messages", style="bright_black")
-            agent.save_session()
-            continue
-
-        agent.max_steps += 20  # give more budget
-        _render_final_answer_panel(agent.run(follow, reset=False), title="Assistant")
-        agent.save_session()
-
-    if args.wkdir:
+    if not args.end:
+        _interactive_loop(agent)
+    if cwd:
         os.chdir(cwd)
 
 if __name__ == "__main__":  # pragma: no cover
