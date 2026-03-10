@@ -558,7 +558,15 @@ class Agent:
         _console_print(renderable, style=style, console=self._console_ref())
 
     def _ui_input(self, prompt: str) -> str:
-        return _console_input(prompt, self._console_ref())
+        live_was_active = self._live is not None and self._owns_live
+        if not live_was_active:
+            return _console_input(prompt, self._console_ref())
+        self._stop_live_display()
+        try:
+            return _console_input(prompt, _console)
+        finally:
+            self._start_live_display()
+            self._refresh_live()
 
     def _build_plan_renderable(self) -> Panel | None:
         if not self._current_plan:
@@ -769,29 +777,59 @@ class Agent:
             self._render_event(f"Total tokens: {total_tokens}", level=2, label="", style="bright_black")
 
     def _prompt_for_approval(self, tool: Tool, args: dict[str, Any], preview: Mapping[str, Any] | None) -> tuple[bool, str | None]:
-        if preview:
-            self._render_detail(preview, force=True)
-        prompt = f"Approve {tool.name}: {tool.describe_call(**args)}? [y/N/m or feedback] "
-        while True:
-            response = self._ui_input(prompt).strip()
-            lowered = response.lower()
-            if lowered == "y":
-                return True, None
-            if lowered == "m":
-                self._render_detail(
-                    {
-                        "kind": "json",
-                        "title": f"Arguments for {tool.name}",
-                        "data": args,
-                        "border_style": "magenta",
-                    },
-                    force=True,
-                )
-                continue
-            if lowered in {"", "n"}:
-                feedback = self._ui_input("Feedback (optional): ").strip()
-                return False, feedback or None
-            return False, response
+        try:
+            action_label = tool.describe_call(**args)
+        except Exception:
+            action_label = tool.name
+        live_was_active = self._live is not None and self._owns_live
+        if live_was_active:
+            self._stop_live_display()
+        try:
+            if preview:
+                self._render_detail(preview, force=True)
+            else:
+                summary = Text()
+                summary.append(f"{tool.name}: ", style="bold white")
+                summary.append(action_label, style="white")
+                self._ui_print(summary)
+
+            notice = Text()
+            notice.append("Approval required", style="bold yellow")
+            notice.append(" • ", style="bright_black")
+            notice.append("y approve", style="green")
+            notice.append(" • ", style="bright_black")
+            notice.append("n reject", style="red")
+            notice.append(" • ", style="bright_black")
+            notice.append("m more details", style="cyan")
+            notice.append(" • ", style="bright_black")
+            notice.append("or type feedback", style="bright_black")
+            self._ui_print(notice)
+
+            while True:
+                response = self._ui_input("decision › ").strip()
+                lowered = response.lower()
+                if lowered == "y":
+                    return True, None
+                if lowered == "m":
+                    self._render_detail(
+                        {
+                            "kind": "json",
+                            "title": f"Arguments for {tool.name}",
+                            "data": args,
+                            "border_style": "magenta",
+                        },
+                        force=True,
+                    )
+                    self._ui_print(notice)
+                    continue
+                if lowered in {"", "n"}:
+                    feedback = self._ui_input("Feedback (optional): ").strip()
+                    return False, feedback or None
+                return False, response
+        finally:
+            if live_was_active:
+                self._start_live_display()
+                self._refresh_live()
 
     def _append_to_summary(self, summary: str) -> None:  # noqa: D401
         os.makedirs(self._trace_dir, exist_ok=True)
@@ -935,6 +973,8 @@ class Agent:
             preview_shown = preview is not None
         try:
             if approved:
+                self._status_message = name
+                self._refresh_live()
                 tool_started = time.perf_counter()
                 return preview, preview_shown, target(**args), int((time.perf_counter() - tool_started) * 1000)
             return preview, preview_shown, target.rejection_result(rejection_feedback, **args), 0
